@@ -1,6 +1,6 @@
 # Tasks
 
-[] what about 2FA?
+- [ ] what about 2FA?
 
 # MetaQC Pipeline
 
