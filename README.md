@@ -1,7 +1,3 @@
-# Tasks
-
-- [ ] what about 2FA?
-
 # Introduction
 
 Ever been told to “just do a quality check” on a bunch of Illumina short reads? Sounds quick and simple—until you sit down to actually run it and suddenly you’re knee-deep in path errors, missing installations, and wondering what exactly you’re supposed to install. Conda? Pixi? Something else entirely?
@@ -109,3 +105,11 @@ project/
 - Session IDs are random UUIDs
 - Directory paths are validated against injection characters
 - In production, restrict CORS origins in `backend/main.py`
+
+ # Tasks
+
+- [ ] what about 2FA?
+- [ ] Fix "Backend Connection" on by defualt on GUI
+- [ ] add bbduk adapter trimming and quality filtering step
+- [ ] add bbduk contaminant DNA removal step
+- [ ] add bbduk error correction step
