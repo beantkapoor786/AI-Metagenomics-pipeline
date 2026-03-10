@@ -52,36 +52,7 @@ Enter your HPC hostname, port (default 22), username, and password or SSH key pa
 
 ## SSH Key Authentication
 
-If using SSH keys, uncomment the volume mount in `docker-compose.yml`:
-
-```yaml
-volumes:
-  - ~/.ssh:/root/.ssh:ro
-```
-
-Then provide the key path as `/root/.ssh/id_rsa` (or your key filename) in the GUI.
-
-## Development (without Docker)
-
-### Backend
-
-```bash
-cd backend
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
-```
-
-### Frontend
-
-```bash
-cd frontend
-npm install
-REACT_APP_API_URL=http://localhost:8000 npm start
-```
-
-The frontend dev server runs on port 3000 with `REACT_APP_API_URL` pointing to the backend.
+If using SSH keys, provide the private key path as `/root/.ssh/id_rsa` (or your key filename) in the GUI.
 
 ## API Endpoints
 
