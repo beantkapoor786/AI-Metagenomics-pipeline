@@ -326,10 +326,9 @@ export default function App() {
         </div>
         <div style={{ display:"flex",alignItems:"center",gap:12 }}>
           {backendOk===false && <span style={{ fontSize:11,color:"#f43f5e",padding:"4px 10px",borderRadius:8,background:"rgba(244,63,94,.1)",border:"1px solid rgba(244,63,94,.2)" }}>⚠ Backend offline</span>}
-          {backendOk===true && <span style={{ fontSize:11,color:"#10b981",padding:"4px 10px",borderRadius:8,background:"rgba(16,185,129,.1)",border:"1px solid rgba(16,185,129,.2)" }}>● Backend connected</span>}
           <div style={{ display:"flex",alignItems:"center",gap:10,padding:"7px 14px",borderRadius:10,background:sshStatus===S.success?"rgba(16,185,129,.1)":"rgba(255,255,255,.03)",border:`1px solid ${sshStatus===S.success?"rgba(16,185,129,.2)":"rgba(255,255,255,.06)"}` }}>
             <div style={{ width:7,height:7,borderRadius:"50%",background:sshStatus===S.success?"#10b981":"rgba(255,255,255,.2)" }}/>
-            <span style={{ fontSize:11,color:"rgba(255,255,255,.5)" }}>{sshStatus===S.success?`${ssh.hostname}:${ssh.port}`:"Not connected"}</span>
+            <span style={{ fontSize:11,color:sshStatus===S.success?"#10b981":"rgba(255,255,255,.5)" }}>{sshStatus===S.success?`HPC connected · ${ssh.hostname}:${ssh.port}`:"Not connected"}</span>
           </div>
         </div>
       </div>
@@ -542,6 +541,59 @@ export default function App() {
               </div>
             </Card>
             <Card><CTitle icon="🌳">Directory Structure</CTitle><DirTree rawDataPath={pipe.rawDataPath}/></Card>
+
+            {/* Exact commands preview */}
+            {(() => {
+              const raw = pipe.rawDataPath;
+              const parent = raw.replace(/\/[^/]+\/?$/, "");
+              const qc = `${parent}/analyses/1_QC`;
+              let fqcCmd, mqcCmd, activateNote;
+              if (tool.method === "conda") {
+                const env = tool.condaEnvName;
+                fqcCmd = `fastqc`;
+                mqcCmd = `multiqc`;
+                activateNote = `conda activate ${env}`;
+              } else if (tool.method === "pixi") {
+                fqcCmd = `pixi run fastqc`;
+                mqcCmd = `pixi run multiqc`;
+                activateNote = `cd ${tool.pixiProjectPath}`;
+              } else {
+                fqcCmd = `fastqc`;
+                mqcCmd = `multiqc`;
+                activateNote = null;
+              }
+              const fullFqc = `${fqcCmd} --threads ${pipe.fastqcThreads} --outdir "${qc}/output/fastqc_reports" "${qc}/input"/*.fastq.gz`;
+              const fullMqc = `${mqcCmd} "${qc}/output/fastqc_reports" --outdir "${qc}/output/multiqc_report" --filename "${pipe.multiqcName}" --force`;
+              const cmdBlockStyle = {
+                padding: "12px 16px", borderRadius: 10, background: "rgba(0,0,0,.3)",
+                border: "1px solid rgba(255,255,255,.06)", fontFamily: mono, fontSize: 11,
+                lineHeight: 1.8, color: "#06b6d4", overflowX: "auto", whiteSpace: "pre-wrap",
+                wordBreak: "break-all",
+              };
+              const labelStyle = {
+                fontSize: 10, color: "rgba(255,255,255,.35)", textTransform: "uppercase",
+                letterSpacing: ".06em", marginBottom: 6, fontWeight: 500,
+              };
+              return (
+                <Card>
+                  <CTitle icon="💻">Exact Commands</CTitle>
+                  {activateNote && (
+                    <div style={{ marginBottom: 14 }}>
+                      <div style={labelStyle}>Environment Activation</div>
+                      <div style={cmdBlockStyle}>$ {activateNote}</div>
+                    </div>
+                  )}
+                  <div style={{ marginBottom: 14 }}>
+                    <div style={labelStyle}>FastQC Command</div>
+                    <div style={cmdBlockStyle}>$ {fullFqc}</div>
+                  </div>
+                  <div style={{ marginBottom: 0 }}>
+                    <div style={labelStyle}>MultiQC Command (runs automatically after FastQC)</div>
+                    <div style={cmdBlockStyle}>$ {fullMqc}</div>
+                  </div>
+                </Card>
+              );
+            })()}
 
             <div style={{ background:"linear-gradient(135deg,rgba(245,158,11,.04),rgba(245,158,11,.08))",border:"1px solid rgba(245,158,11,.15)",borderRadius:16,padding:"18px 24px",marginBottom:18,display:"flex",alignItems:"center",justifyContent:"space-between" }}>
               <div>

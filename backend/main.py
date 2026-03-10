@@ -1,9 +1,11 @@
 """
 MetaQC Pipeline — FastAPI Backend
 SSH via paramiko, real-time logs via WebSocket.
+All blocking SSH calls run in thread pool to avoid blocking async loop.
 """
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -19,7 +21,6 @@ from pydantic import BaseModel
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("metaqc")
 
-# ─── Session store: session_id -> { ssh_client, config } ────────────────────
 sessions: dict = {}
 
 
@@ -44,7 +45,7 @@ app.add_middleware(
 )
 
 
-# ─── Models ──────────────────────────────────────────────────────────────────
+# Models
 
 class SSHConnectRequest(BaseModel):
     hostname: str
@@ -62,7 +63,7 @@ class ScanDirectoryRequest(BaseModel):
 
 class InstallToolsPayload(BaseModel):
     session_id: str
-    method: str  # "conda" | "pixi" | "path"
+    method: str
     conda_use_mamba: bool = False
     conda_create_new: bool = True
     conda_env_name: str = "metagenomics_qc"
@@ -83,7 +84,7 @@ class RunPipelinePayload(BaseModel):
     conda_use_mamba: bool = False
 
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
+# Helpers
 
 def get_client(session_id: str) -> paramiko.SSHClient:
     if session_id not in sessions:
@@ -95,18 +96,35 @@ def get_client(session_id: str) -> paramiko.SSHClient:
     return c
 
 
-def ssh_exec(client: paramiko.SSHClient, cmd: str, timeout: int = 120):
-    _, stdout, stderr = client.exec_command(cmd, timeout=timeout)
-    code = stdout.channel.recv_exit_status()
-    return stdout.read().decode("utf-8", errors="replace"), stderr.read().decode("utf-8", errors="replace"), code
+def _ssh_exec_sync(client, cmd, timeout=120):
+    """Blocking SSH exec."""
+    try:
+        _, stdout, stderr = client.exec_command(cmd, timeout=timeout)
+        code = stdout.channel.recv_exit_status()
+        out = stdout.read().decode("utf-8", errors="replace")
+        err = stderr.read().decode("utf-8", errors="replace")
+        return out, err, code
+    except Exception as e:
+        return "", str(e), -1
 
 
-async def stream_channel(channel, websocket, stage: str):
-    """Read from SSH channel and stream lines to websocket."""
+async def ssh_exec(client, cmd, timeout=120):
+    """Non-blocking SSH exec via thread pool."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None, functools.partial(_ssh_exec_sync, client, cmd, timeout)
+    )
+
+
+async def stream_channel_async(channel, websocket, stage):
+    """Stream SSH channel output to websocket without blocking."""
     lines = []
+    loop = asyncio.get_event_loop()
     while True:
-        if channel.recv_ready():
-            chunk = channel.recv(4096).decode("utf-8", errors="replace")
+        has_data = await loop.run_in_executor(None, channel.recv_ready)
+        if has_data:
+            chunk = await loop.run_in_executor(None, channel.recv, 4096)
+            chunk = chunk.decode("utf-8", errors="replace")
             for line in chunk.split("\n"):
                 if line.strip():
                     await websocket.send_json({
@@ -114,9 +132,14 @@ async def stream_channel(channel, websocket, stage: str):
                         "message": f"  {line.strip()}", "level": "info",
                     })
                     lines.append(line)
-        if channel.exit_status_ready():
-            while channel.recv_ready():
-                chunk = channel.recv(4096).decode("utf-8", errors="replace")
+        is_done = await loop.run_in_executor(None, channel.exit_status_ready)
+        if is_done:
+            while True:
+                has_more = await loop.run_in_executor(None, channel.recv_ready)
+                if not has_more:
+                    break
+                chunk = await loop.run_in_executor(None, channel.recv, 4096)
+                chunk = chunk.decode("utf-8", errors="replace")
                 for line in chunk.split("\n"):
                     if line.strip():
                         await websocket.send_json({
@@ -126,16 +149,12 @@ async def stream_channel(channel, websocket, stage: str):
                         lines.append(line)
             break
         await asyncio.sleep(0.15)
-    return channel.recv_exit_status(), lines
+    exit_code = await loop.run_in_executor(None, channel.recv_exit_status)
+    return exit_code, lines
 
 
 def build_activate(req):
-    """Return (activate_prefix, fqc_cmd, mqc_cmd)."""
-    if hasattr(req, "tool_method"):
-        method = req.tool_method
-    else:
-        method = req.method
-
+    method = getattr(req, "tool_method", None) or getattr(req, "method", "path")
     if method == "conda":
         env = req.conda_env_name
         act = f"source activate {env} 2>/dev/null || conda activate {env} 2>/dev/null"
@@ -143,17 +162,16 @@ def build_activate(req):
     elif method == "pixi":
         act = f'cd "{req.pixi_project_path}"'
         return act, "pixi run fastqc", "pixi run multiqc"
-    else:
-        return "", "fastqc", "multiqc"
+    return "", "fastqc", "multiqc"
 
 
-def wrap_cmd(activate: str, cmd: str) -> str:
+def wrap_cmd(activate, cmd):
     if activate:
         return f'bash -c "{activate} && {cmd}"'
     return cmd
 
 
-# ─── REST Endpoints ──────────────────────────────────────────────────────────
+# REST Endpoints
 
 @app.get("/api/health")
 async def health():
@@ -161,65 +179,54 @@ async def health():
 
 
 @app.post("/api/ssh/connect")
-async def ssh_connect(req: SSHConnectRequest):
+async def ssh_connect_endpoint(req: SSHConnectRequest):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
     kwargs = {
-        "hostname": req.hostname,
-        "port": req.port,
+        "hostname": req.hostname, "port": req.port,
         "username": req.username,
-        "timeout": 15,
-        "banner_timeout": 15,
-        "auth_timeout": 15,
+        "timeout": 15, "banner_timeout": 15, "auth_timeout": 15,
     }
 
     try:
         if req.auth_method == "key" and req.key_path:
             kp = req.key_path
-
-            # Remap host paths to container mount point.
-            # The docker-compose mounts ~/.ssh -> /home/appuser/.ssh
-            # So /Users/*/. ssh/keyname -> /home/appuser/.ssh/keyname
-            # Also handle ~/.ssh/keyname
             key_filename = os.path.basename(kp)
             container_ssh_dir = "/home/appuser/.ssh"
             remapped = os.path.join(container_ssh_dir, key_filename)
-
             if os.path.exists(remapped):
                 kp = remapped
-                logger.info(f"Remapped key path: {req.key_path} -> {kp}")
+                logger.info(f"Remapped key: {req.key_path} -> {kp}")
             elif os.path.exists(os.path.expanduser(kp)):
                 kp = os.path.expanduser(kp)
             else:
-                # Try the remapped path as primary
                 raise FileNotFoundError(
-                    f"Key not found. The file '{key_filename}' was not found in the mounted SSH directory. "
-                    f"Ensure your ~/.ssh directory contains this key file and Docker volume mount is active."
+                    f"Key '{key_filename}' not found in mounted SSH directory. "
+                    f"Ensure ~/.ssh is mounted in Docker and contains this key."
                 )
-
             kwargs["key_filename"] = kp
         elif req.auth_method == "password" and req.password:
             kwargs["password"] = req.password
         else:
             raise ValueError("Provide password or key path")
 
-        client.connect(**kwargs)
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, functools.partial(client.connect, **kwargs))
+
         sid = str(uuid.uuid4())[:12]
         sessions[sid] = {"ssh_client": client, "config": {
             "hostname": req.hostname, "port": req.port,
             "username": req.username, "auth_method": req.auth_method,
         }}
 
-        uname, _, _ = ssh_exec(client, "uname -n")
+        uname, _, _ = await ssh_exec(client, "uname -n")
         logger.info(f"Connected: {req.username}@{req.hostname}:{req.port} [{sid}]")
-
         return {
             "session_id": sid, "success": True,
             "message": f"Connected to {uname.strip() or req.hostname}",
             "remote_hostname": uname.strip() or req.hostname,
         }
-
     except paramiko.AuthenticationException:
         client.close()
         raise HTTPException(401, "Authentication failed")
@@ -249,16 +256,15 @@ async def ssh_disconnect(session_id: str):
 @app.post("/api/scan-directory")
 async def scan_directory(req: ScanDirectoryRequest):
     client = get_client(req.session_id)
-
     bad = [";", "&", "|", "`", "$", "(", ")", "{", "}"]
     if any(c in req.path for c in bad):
         raise HTTPException(400, "Invalid characters in path")
 
-    out, _, code = ssh_exec(client, f'test -d "{req.path}" && echo "Y" || echo "N"')
+    out, _, code = await ssh_exec(client, f'test -d "{req.path}" && echo "Y" || echo "N"')
     if "N" in out:
         raise HTTPException(404, f"Directory not found: {req.path}")
 
-    out, _, code = ssh_exec(client, f'ls -1 "{req.path}"/*.fastq.gz 2>/dev/null')
+    out, _, code = await ssh_exec(client, f'ls -1 "{req.path}"/*.fastq.gz 2>/dev/null')
     if code != 0 or not out.strip():
         raise HTTPException(404, f"No .fastq.gz files found in {req.path}")
 
@@ -267,7 +273,6 @@ async def scan_directory(req: ScanDirectoryRequest):
         for f in out.strip().split("\n")
         if f.strip().endswith(".fastq.gz")
     ])
-
     if not files:
         raise HTTPException(404, f"No .fastq.gz files found in {req.path}")
 
@@ -282,11 +287,10 @@ async def scan_directory(req: ScanDirectoryRequest):
         if any(marker in f for f in files):
             detected = label
             break
-
     return {"files": files, "count": len(files), "pattern": detected, "path": req.path}
 
 
-# ─── WebSocket: Install Tools ────────────────────────────────────────────────
+# WebSocket: Install Tools
 
 @app.websocket("/ws/install-tools")
 async def ws_install_tools(websocket: WebSocket):
@@ -299,122 +303,197 @@ async def ws_install_tools(websocket: WebSocket):
         async def log(msg, lvl="info"):
             await websocket.send_json({"type": "log", "message": msg, "level": lvl})
 
-        async def status(s):
+        async def set_status(s):
             await websocket.send_json({"type": "status", "status": s})
 
-        await status("running")
+        await set_status("running")
 
         if req.method == "path":
-            for tool in ["fastqc", "multiqc"]:
-                await log(f">>> Checking {tool} availability...")
-                out, _, code = ssh_exec(client, f"which {tool} 2>/dev/null")
+            for tn in ["fastqc", "multiqc"]:
+                await log(f">>> Checking {tn} availability...")
+                out, err, code = await ssh_exec(client, f"which {tn} 2>/dev/null")
                 if code == 0 and out.strip():
-                    await log(f"$ which {tool}")
+                    await log(f"$ which {tn}")
                     await log(f"  {out.strip()}")
-                    v, _, _ = ssh_exec(client, f"{tool} --version 2>&1")
+                    await log(f">>> Getting {tn} version...")
+                    v, _, _ = await ssh_exec(client, f"{tn} --version 2>&1", timeout=60)
                     await log(f"  {v.strip()}")
-                    await log(f"✓ {tool} found", "success")
+                    await log(f"✓ {tn} found", "success")
                 else:
-                    await log(f"✗ {tool} not found in PATH", "error")
-                    await status("error")
+                    await log(f"✗ {tn} not found in PATH", "error")
+                    if err.strip():
+                        await log(f"  {err.strip()}", "error")
+                    await set_status("error")
                     return
                 await log("")
             await log("SUCCESS All tools verified!", "success")
-            await status("success")
+            await set_status("success")
 
         elif req.method == "conda":
             mgr = "mamba" if req.conda_use_mamba else "conda"
-
             if req.conda_create_new:
                 await log(f">>> Creating {mgr} environment: {req.conda_env_name}")
                 cmd = f"{mgr} create -n {req.conda_env_name} -y 2>&1"
                 await log(f"$ {cmd}")
-                out, err, code = ssh_exec(client, cmd, timeout=300)
-                for l in out.strip().split("\n")[-5:]:
-                    if l.strip():
-                        await log(f"  {l.strip()}")
+                out, err, code = await ssh_exec(client, cmd, timeout=300)
+                for ln in out.strip().split("\n")[-5:]:
+                    if ln.strip():
+                        await log(f"  {ln.strip()}")
                 if code != 0:
                     await log(f"✗ Failed: {err.strip()}", "error")
-                    await status("error")
+                    await set_status("error")
                     return
-                await log(f"✓ Environment created", "success")
+                await log("✓ Environment created", "success")
                 await log("")
 
-            for tool, flag in [("fastqc", req.needs_install_fastqc), ("multiqc", req.needs_install_multiqc)]:
+            for tn, flag in [("fastqc", req.needs_install_fastqc), ("multiqc", req.needs_install_multiqc)]:
                 if flag:
-                    await log(f">>> Installing {tool} via {mgr}...")
-                    cmd = f"{mgr} install -n {req.conda_env_name} -c bioconda -c conda-forge {tool} -y 2>&1"
+                    await log(f">>> Installing {tn} via {mgr}...")
+                    cmd = f"{mgr} install -n {req.conda_env_name} -c bioconda -c conda-forge {tn} -y 2>&1"
                     await log(f"$ {cmd}")
-                    out, err, code = ssh_exec(client, cmd, timeout=600)
-                    for l in out.strip().split("\n")[-5:]:
-                        if l.strip():
-                            await log(f"  {l.strip()}")
+                    out, err, code = await ssh_exec(client, cmd, timeout=600)
+                    for ln in out.strip().split("\n")[-5:]:
+                        if ln.strip():
+                            await log(f"  {ln.strip()}")
                     if code != 0:
-                        await log(f"✗ {tool} install failed", "error")
-                        await status("error")
+                        await log(f"✗ {tn} install failed: {err.strip()}", "error")
+                        await set_status("error")
                         return
-                    await log(f"✓ {tool} installed", "success")
+                    await log(f"✓ {tn} installed", "success")
                     await log("")
 
-            await log(">>> Verifying...")
+            await log(">>> Verifying (may take a moment)...")
             act = f"source activate {req.conda_env_name} 2>/dev/null || conda activate {req.conda_env_name} 2>/dev/null"
-            for tool in ["fastqc", "multiqc"]:
-                v, _, _ = ssh_exec(client, f'bash -c "{act} && {tool} --version 2>&1"')
-                await log(f"  {tool}: {v.strip()}")
+            for tn in ["fastqc", "multiqc"]:
+                await log(f"  Checking {tn}...")
+                v, err, code = await ssh_exec(client, f'bash -c "{act} && {tn} --version 2>&1"', timeout=120)
+                if v.strip():
+                    await log(f"  {tn}: {v.strip()}")
+                else:
+                    await log(f"  {tn}: no output (exit {code})", "error")
             await log("")
             await log("SUCCESS All tools installed and verified!", "success")
-            await status("success")
+            await set_status("success")
 
         elif req.method == "pixi":
             if req.pixi_create_new:
                 await log(f">>> Initializing pixi project at {req.pixi_project_path}")
                 cmd = f'mkdir -p "{req.pixi_project_path}" && cd "{req.pixi_project_path}" && pixi init 2>&1'
                 await log(f"$ {cmd}")
-                out, err, code = ssh_exec(client, cmd, timeout=60)
+                out, err, code = await ssh_exec(client, cmd, timeout=60)
                 if out.strip():
                     await log(f"  {out.strip()}")
                 if code != 0 and "already" not in (out + err).lower():
-                    await log(f"✗ pixi init failed", "error")
-                    await status("error")
+                    await log(f"✗ pixi init failed: {err.strip()}", "error")
+                    await set_status("error")
                     return
                 await log("✓ Project initialized", "success")
 
                 for ch in ["bioconda", "conda-forge"]:
                     cmd = f'cd "{req.pixi_project_path}" && pixi project channel add {ch} 2>&1'
                     await log(f"$ pixi project channel add {ch}")
-                    out, _, _ = ssh_exec(client, cmd, timeout=30)
+                    out, _, _ = await ssh_exec(client, cmd, timeout=30)
                     if out.strip():
                         await log(f"  {out.strip()}")
                     await log(f"✓ Channel {ch} added", "success")
                 await log("")
+            else:
+                # Existing project: verify pixi.toml exists
+                await log(f">>> Verifying pixi project at {req.pixi_project_path}...")
+                out, _, code = await ssh_exec(
+                    client,
+                    f'test -f "{req.pixi_project_path}/pixi.toml" && echo "FOUND" || echo "MISSING"'
+                )
+                if "MISSING" in out:
+                    await log(f"✗ No pixi.toml found at {req.pixi_project_path}", "error")
+                    await log("  Ensure the path points to an initialized pixi project.", "error")
+                    await set_status("error")
+                    return
+                await log("✓ pixi.toml found", "success")
+                await log("")
 
-            for tool, flag in [("fastqc", req.needs_install_fastqc), ("multiqc", req.needs_install_multiqc)]:
+            # Install tools if checkboxes are checked
+            for tn, flag in [("fastqc", req.needs_install_fastqc), ("multiqc", req.needs_install_multiqc)]:
                 if flag:
-                    await log(f">>> Adding {tool}...")
-                    cmd = f'cd "{req.pixi_project_path}" && pixi add {tool} 2>&1'
+                    await log(f">>> Adding {tn} to pixi project...")
+                    cmd = f'cd "{req.pixi_project_path}" && pixi add {tn} 2>&1'
                     await log(f"$ {cmd}")
-                    out, err, code = ssh_exec(client, cmd, timeout=300)
-                    for l in out.strip().split("\n")[-5:]:
-                        if l.strip():
-                            await log(f"  {l.strip()}")
+                    out, err, code = await ssh_exec(client, cmd, timeout=300)
+                    for ln in out.strip().split("\n")[-5:]:
+                        if ln.strip():
+                            await log(f"  {ln.strip()}")
                     if code != 0:
-                        await log(f"✗ Failed to add {tool}", "error")
-                        await status("error")
+                        await log(f"✗ Failed to add {tn}: {err.strip()}", "error")
+                        await set_status("error")
                         return
-                    await log(f"✓ {tool} added", "success")
+                    await log(f"✓ {tn} added", "success")
                     await log("")
 
-            await log(">>> Verifying...")
-            for tool in ["fastqc", "multiqc"]:
-                v, _, _ = ssh_exec(client, f'cd "{req.pixi_project_path}" && pixi run {tool} --version 2>&1')
-                await log(f"  {tool}: {v.strip()}")
+            # Verify tools — use streaming to show progress (pixi first-run can be slow)
+            await log(">>> Verifying tools...")
+            await log("  (First run may take a while as pixi resolves the environment)")
             await log("")
+            for tn in ["fastqc", "multiqc"]:
+                await log(f"  Checking {tn}...")
+                cmd = f'cd "{req.pixi_project_path}" && pixi run {tn} --version 2>&1'
+                await log(f"  $ {cmd}")
+
+                # Use streaming channel so output appears in real-time
+                transport = client.get_transport()
+                channel = transport.open_session()
+                channel.settimeout(600)  # 10 min for first pixi resolve
+                channel.exec_command(cmd)
+
+                tool_output = []
+                loop = asyncio.get_event_loop()
+                heartbeat_count = 0
+                while True:
+                    has_data = await loop.run_in_executor(None, channel.recv_ready)
+                    if has_data:
+                        chunk = await loop.run_in_executor(None, channel.recv, 4096)
+                        text = chunk.decode("utf-8", errors="replace")
+                        for line in text.split("\n"):
+                            if line.strip():
+                                await log(f"    {line.strip()}")
+                                tool_output.append(line.strip())
+                    is_done = await loop.run_in_executor(None, lambda: channel.exit_status_ready())
+                    if is_done:
+                        # Drain remaining
+                        while True:
+                            has_more = await loop.run_in_executor(None, channel.recv_ready)
+                            if not has_more:
+                                break
+                            chunk = await loop.run_in_executor(None, channel.recv, 4096)
+                            text = chunk.decode("utf-8", errors="replace")
+                            for line in text.split("\n"):
+                                if line.strip():
+                                    await log(f"    {line.strip()}")
+                                    tool_output.append(line.strip())
+                        break
+                    # Send heartbeat so frontend knows we're alive
+                    heartbeat_count += 1
+                    if heartbeat_count % 10 == 0:
+                        await log(f"    ... still working ({heartbeat_count // 5}s elapsed)")
+                    await asyncio.sleep(0.5)
+
+                exit_code = channel.recv_exit_status()
+                channel.close()
+
+                if exit_code == 0 and tool_output:
+                    await log(f"  ✓ {tn} verified", "success")
+                else:
+                    await log(f"  ✗ {tn} verification failed (exit {exit_code})", "error")
+                    await set_status("error")
+                    return
+                await log("")
+
             await log("SUCCESS All tools installed and verified!", "success")
-            await status("success")
+            await set_status("success")
 
     except WebSocketDisconnect:
         logger.info("WS disconnected (install)")
     except Exception as e:
+        logger.error(f"Install error: {e}", exc_info=True)
         try:
             await websocket.send_json({"type": "log", "message": f"ERROR {e}", "level": "error"})
             await websocket.send_json({"type": "status", "status": "error"})
@@ -427,7 +506,7 @@ async def ws_install_tools(websocket: WebSocket):
             pass
 
 
-# ─── WebSocket: Run Pipeline ─────────────────────────────────────────────────
+# WebSocket: Run Pipeline
 
 @app.websocket("/ws/run-pipeline")
 async def ws_run_pipeline(websocket: WebSocket):
@@ -436,29 +515,29 @@ async def ws_run_pipeline(websocket: WebSocket):
         data = await websocket.receive_json()
         req = RunPipelinePayload(**data)
         client = get_client(req.session_id)
-
         activate, fqc_cmd, mqc_cmd = build_activate(req)
 
         async def log(msg, stage="fastqc", lvl="info"):
             await websocket.send_json({"type": "log", "stage": stage, "message": msg, "level": lvl})
 
-        async def sstatus(stage, s):
+        async def set_status(stage, s):
             await websocket.send_json({"type": "status", "stage": stage, "status": s})
 
         raw = req.raw_data_path.rstrip("/")
         parent = os.path.dirname(raw)
         qc = f"{parent}/analyses/1_QC"
+        loop = asyncio.get_event_loop()
 
-        # ════════ FASTQC ════════
-        await sstatus("fastqc", "running")
+        # FASTQC
+        await set_status("fastqc", "running")
 
         await log(">>> Creating directory structure...", "fastqc")
         mk = f'mkdir -p "{qc}/input" "{qc}/output/fastqc_reports" "{qc}/output/multiqc_report" "{qc}/logs" "{qc}/scripts"'
         await log(f"$ {mk}", "fastqc")
-        _, err, code = ssh_exec(client, mk)
+        _, err, code = await ssh_exec(client, mk)
         if code != 0:
             await log(f"✗ {err.strip()}", "fastqc", "error")
-            await sstatus("fastqc", "error")
+            await set_status("fastqc", "error")
             return
         await log("✓ Directories created", "fastqc", "success")
         await log("", "fastqc")
@@ -466,94 +545,94 @@ async def ws_run_pipeline(websocket: WebSocket):
         await log(">>> Symlinking raw FASTQ files...", "fastqc")
         sym = f'for f in "{raw}"/*.fastq.gz; do [ -e "$f" ] && ln -sf "$f" "{qc}/input/$(basename "$f")"; done'
         await log(f"$ {sym}", "fastqc")
-        ssh_exec(client, sym)
+        await ssh_exec(client, sym)
 
-        ls_out, _, _ = ssh_exec(client, f'ls -1 "{qc}/input/"*.fastq.gz 2>/dev/null')
+        ls_out, _, _ = await ssh_exec(client, f'ls -1 "{qc}/input/"*.fastq.gz 2>/dev/null')
         linked = [os.path.basename(f.strip()) for f in ls_out.strip().split("\n") if f.strip()]
         for f in linked:
-            await log(f"  → {f}", "fastqc")
+            await log(f"  -> {f}", "fastqc")
         await log(f"✓ {len(linked)} files symlinked", "fastqc", "success")
         await log("", "fastqc")
 
         await log(">>> Recording FastQC version...", "fastqc")
-        v_out, _, _ = ssh_exec(client, wrap_cmd(activate, f"{fqc_cmd} --version 2>&1"))
+        v_out, _, _ = await ssh_exec(client, wrap_cmd(activate, f"{fqc_cmd} --version 2>&1"), timeout=120)
         fqc_ver = v_out.strip()
         await log(f"  {fqc_ver}", "fastqc")
-        ssh_exec(client, f'echo "FastQC: {fqc_ver}" > "{qc}/logs/software_versions.txt"')
+        await ssh_exec(client, f'echo "FastQC: {fqc_ver}" > "{qc}/logs/software_versions.txt"')
         await log("", "fastqc")
 
-        # Save script
         script = generate_fastqc_script(req, activate, fqc_cmd, qc, raw, fqc_ver)
-        ssh_exec(client, f"cat > \"{qc}/scripts/run_fastqc.sh\" << 'METAQC_EOF'\n{script}\nMETAQC_EOF")
-        ssh_exec(client, f'chmod +x "{qc}/scripts/run_fastqc.sh"')
+        await ssh_exec(client, f"cat > \"{qc}/scripts/run_fastqc.sh\" << 'METAQC_EOF'\n{script}\nMETAQC_EOF")
+        await ssh_exec(client, f'chmod +x "{qc}/scripts/run_fastqc.sh"')
 
         await log(f">>> Running FastQC with {req.fastqc_threads} threads...", "fastqc")
         run = wrap_cmd(activate, f'{fqc_cmd} --threads {req.fastqc_threads} --outdir "{qc}/output/fastqc_reports" "{qc}/input"/*.fastq.gz 2>&1')
         await log(f"$ {fqc_cmd} --threads {req.fastqc_threads} --outdir .../fastqc_reports/ .../input/*.fastq.gz", "fastqc")
 
-        ch = client.get_transport().open_session()
-        ch.exec_command(run)
-        exit_code, log_lines = await stream_channel(ch, websocket, "fastqc")
-        ch.close()
+        ch = await loop.run_in_executor(None, client.get_transport().open_session)
+        await loop.run_in_executor(None, ch.exec_command, run)
+        exit_code, log_lines = await stream_channel_async(ch, websocket, "fastqc")
+        await loop.run_in_executor(None, ch.close)
 
-        ssh_exec(client, f"cat > \"{qc}/logs/fastqc.log\" << 'METAQC_EOF'\n" + "\n".join(log_lines) + "\nMETAQC_EOF")
+        await ssh_exec(client, f"cat > \"{qc}/logs/fastqc.log\" << 'METAQC_EOF'\n" + "\n".join(log_lines) + "\nMETAQC_EOF")
 
         if exit_code != 0:
             await log(f"✗ FastQC failed (exit {exit_code})", "fastqc", "error")
-            await sstatus("fastqc", "error")
+            await set_status("fastqc", "error")
             return
 
         await log("", "fastqc")
         await log("✓ FastQC complete", "fastqc", "success")
         vc = fqc_ver.replace("FastQC v", "").replace("FastQC ", "").strip()
-        ssh_exec(client, f'cp "{qc}/scripts/run_fastqc.sh" "{qc}/scripts/run_fastqc_v{vc}.sh" 2>/dev/null')
+        await ssh_exec(client, f'cp "{qc}/scripts/run_fastqc.sh" "{qc}/scripts/run_fastqc_v{vc}.sh" 2>/dev/null')
         await log(f"✓ Script archived: run_fastqc_v{vc}.sh", "fastqc", "success")
-        await sstatus("fastqc", "success")
+        await set_status("fastqc", "success")
 
-        # ════════ MULTIQC ════════
+        # MULTIQC
         await asyncio.sleep(0.5)
-        await sstatus("multiqc", "running")
+        await set_status("multiqc", "running")
 
         await log(">>> Recording MultiQC version...", "multiqc")
-        v_out, _, _ = ssh_exec(client, wrap_cmd(activate, f"{mqc_cmd} --version 2>&1"))
+        v_out, _, _ = await ssh_exec(client, wrap_cmd(activate, f"{mqc_cmd} --version 2>&1"), timeout=120)
         mqc_ver = v_out.strip()
         await log(f"  {mqc_ver}", "multiqc")
-        ssh_exec(client, f'echo "MultiQC: {mqc_ver}" >> "{qc}/logs/software_versions.txt"')
+        await ssh_exec(client, f'echo "MultiQC: {mqc_ver}" >> "{qc}/logs/software_versions.txt"')
         await log("", "multiqc")
 
         script = generate_multiqc_script(req, activate, mqc_cmd, qc, mqc_ver)
-        ssh_exec(client, f"cat > \"{qc}/scripts/run_multiqc.sh\" << 'METAQC_EOF'\n{script}\nMETAQC_EOF")
-        ssh_exec(client, f'chmod +x "{qc}/scripts/run_multiqc.sh"')
+        await ssh_exec(client, f"cat > \"{qc}/scripts/run_multiqc.sh\" << 'METAQC_EOF'\n{script}\nMETAQC_EOF")
+        await ssh_exec(client, f'chmod +x "{qc}/scripts/run_multiqc.sh"')
 
         await log(">>> Running MultiQC...", "multiqc")
         run = wrap_cmd(activate, f'{mqc_cmd} "{qc}/output/fastqc_reports" --outdir "{qc}/output/multiqc_report" --filename "{req.multiqc_name}" --force 2>&1')
         await log(f"$ {mqc_cmd} .../fastqc_reports/ --outdir .../multiqc_report/ --filename {req.multiqc_name} --force", "multiqc")
 
-        ch = client.get_transport().open_session()
-        ch.exec_command(run)
-        exit_code, log_lines = await stream_channel(ch, websocket, "multiqc")
-        ch.close()
+        ch = await loop.run_in_executor(None, client.get_transport().open_session)
+        await loop.run_in_executor(None, ch.exec_command, run)
+        exit_code, log_lines = await stream_channel_async(ch, websocket, "multiqc")
+        await loop.run_in_executor(None, ch.close)
 
-        ssh_exec(client, f"cat > \"{qc}/logs/multiqc.log\" << 'METAQC_EOF'\n" + "\n".join(log_lines) + "\nMETAQC_EOF")
+        await ssh_exec(client, f"cat > \"{qc}/logs/multiqc.log\" << 'METAQC_EOF'\n" + "\n".join(log_lines) + "\nMETAQC_EOF")
 
         if exit_code != 0:
             await log(f"✗ MultiQC failed (exit {exit_code})", "multiqc", "error")
-            await sstatus("multiqc", "error")
+            await set_status("multiqc", "error")
             return
 
         await log("", "multiqc")
         await log("✓ MultiQC complete", "multiqc", "success")
         await log(f"✓ Report: {qc}/output/multiqc_report/{req.multiqc_name}.html", "multiqc", "success")
         vc = mqc_ver.split("version")[-1].strip().strip(",") if "version" in mqc_ver else mqc_ver.strip()
-        ssh_exec(client, f'cp "{qc}/scripts/run_multiqc.sh" "{qc}/scripts/run_multiqc_v{vc}.sh" 2>/dev/null')
+        await ssh_exec(client, f'cp "{qc}/scripts/run_multiqc.sh" "{qc}/scripts/run_multiqc_v{vc}.sh" 2>/dev/null')
         await log(f"✓ Script archived: run_multiqc_v{vc}.sh", "multiqc", "success")
         await log("", "multiqc")
         await log("SUCCESS All QC analyses complete!", "multiqc", "success")
-        await sstatus("multiqc", "success")
+        await set_status("multiqc", "success")
 
     except WebSocketDisconnect:
         logger.info("WS disconnected (pipeline)")
     except Exception as e:
+        logger.error(f"Pipeline error: {e}", exc_info=True)
         try:
             await websocket.send_json({"type": "log", "stage": "fastqc", "message": f"ERROR {e}", "level": "error"})
             await websocket.send_json({"type": "status", "stage": "fastqc", "status": "error"})
@@ -566,12 +645,12 @@ async def ws_run_pipeline(websocket: WebSocket):
             pass
 
 
-# ─── Script Generators ───────────────────────────────────────────────────────
+# Script Generators
 
 def generate_fastqc_script(req, activate, fqc_cmd, qc, raw, version):
     act_line = f"\n# Activate environment\n{activate}\n" if activate else ""
     return f"""#!/usr/bin/env bash
-# FastQC Script — Generated by MetaQC Pipeline
+# FastQC Script - Generated by MetaQC Pipeline
 # Version: {version} | Method: {req.tool_method}
 set -euo pipefail
 {act_line}
@@ -588,7 +667,7 @@ for f in "$RAW"/*.fastq.gz; do [ -e "$f" ] && ln -sf "$f" "$QC/input/$(basename 
 def generate_multiqc_script(req, activate, mqc_cmd, qc, version):
     act_line = f"\n# Activate environment\n{activate}\n" if activate else ""
     return f"""#!/usr/bin/env bash
-# MultiQC Script — Generated by MetaQC Pipeline
+# MultiQC Script - Generated by MetaQC Pipeline
 # Version: {version} | Method: {req.tool_method}
 set -euo pipefail
 {act_line}

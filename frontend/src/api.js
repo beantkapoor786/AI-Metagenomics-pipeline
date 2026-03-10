@@ -55,6 +55,7 @@ export async function scanDirectory(sessionId, path) {
  */
 function openWS(path, payload, onMessage, onClose) {
   const ws = new WebSocket(`${WS_BASE}${path}`);
+  let receivedFinalStatus = false;
 
   ws.onopen = () => {
     ws.send(JSON.stringify(payload));
@@ -63,6 +64,9 @@ function openWS(path, payload, onMessage, onClose) {
   ws.onmessage = (evt) => {
     try {
       const data = JSON.parse(evt.data);
+      if (data.type === "status" && (data.status === "success" || data.status === "error")) {
+        receivedFinalStatus = true;
+      }
       onMessage(data);
     } catch (e) {
       console.error("WS parse error:", e);
@@ -71,13 +75,24 @@ function openWS(path, payload, onMessage, onClose) {
 
   ws.onerror = (err) => {
     console.error("WS error:", err);
+    // Send error status so UI doesn't stay stuck
+    if (!receivedFinalStatus) {
+      onMessage({ type: "log", message: "ERROR WebSocket connection error", level: "error", stage: "fastqc" });
+      onMessage({ type: "status", status: "error", stage: "fastqc" });
+    }
   };
 
-  ws.onclose = () => {
+  ws.onclose = (evt) => {
+    // If closed without a final status, report error so UI doesn't stay stuck
+    if (!receivedFinalStatus) {
+      onMessage({ type: "log", message: `ERROR Connection closed unexpectedly (code: ${evt.code})`, level: "error", stage: "fastqc" });
+      onMessage({ type: "status", status: "error", stage: "fastqc" });
+    }
     if (onClose) onClose();
   };
 
   return () => {
+    receivedFinalStatus = true; // prevent error on intentional close
     if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
       ws.close();
     }
