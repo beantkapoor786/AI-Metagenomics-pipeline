@@ -1,7 +1,6 @@
 # Tasks
 
-[ ] In tool setup, I chose pixi, and then I chose use existing. I provided the correct path to pixi env but it is stuck after I pressed the install & verify step.
-[ ] what about 2FA?
+[] what about 2FA?
 
 # MetaQC Pipeline
 
