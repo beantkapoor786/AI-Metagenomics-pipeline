@@ -108,6 +108,8 @@ project/
 
  # Tasks
 
+- [ ] When I select "Use existing" in Pixi, it should change "Install" to "Verify"
+- [ ] Same for conda
 - [ ] what about 2FA?
 - [ ] Fix "Backend Connection" on by defualt on GUI
 - [ ] add bbduk adapter trimming and quality filtering step
