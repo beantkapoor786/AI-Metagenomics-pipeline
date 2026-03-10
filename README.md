@@ -2,6 +2,12 @@
 
 - [ ] what about 2FA?
 
+# Introduction
+
+Ever been told to “just do a quality check” on a bunch of Illumina short reads? Sounds quick and simple—until you sit down to actually run it and suddenly you’re knee-deep in path errors, missing installations, and wondering what exactly you’re supposed to install. Conda? Pixi? Something else entirely?
+
+If you’ve ever been there—and especially if you don’t have much command-line experience but still want to generate a clean, interactive quality report through a GUI—then you’re in the right place.
+
 # MetaQC Pipeline
 
 A web-based GUI for metagenomics quality control workflows on HPC clusters.  
