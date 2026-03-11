@@ -6,6 +6,8 @@ If you’ve ever been there and especially if you don’t have much command line
 
 # What info do you need to have to run this GUI?
 
+- Docker app. Please download it from here - [Docker for Mac](https://docs.docker.com/desktop/setup/install/mac-install/)
+- You must open the app once and then follow the Quick Start guideline below.
 - Your HPC details (Hostname or IP address, username, password/SSH private key path.
 - HPC should have one of these package managers installed - Conda, mamba, Pixi.
 - If you use Conda, provide the conda environment name where softwares are installed. Same for mamba.
