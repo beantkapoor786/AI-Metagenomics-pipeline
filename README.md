@@ -4,6 +4,21 @@ Ever been told to “just do a quality check” on a bunch of Illumina short rea
 
 If you’ve ever been there—and especially if you don’t have much command-line experience but still want to generate a clean, interactive quality report through a GUI—then you’re in the right place.
 
+# What info do you need to have to run this GUI?
+
+- Your HPC details (Hostname or IP address, username, password/SSH private key path.
+- HPC should have one of these package managers installed - Conda, mamba, Pixi.
+- If you use Conda, provide the conda environment name where softwares are installed. Same for mamba.
+- If you use Pixi, provide Pixi package PATH.
+- If you use one of these package managers, GUI will ask if you have softwares installed. If not, it will install them for you.
+- If above mentioned package managers are not installed, softwares should have been manually installed and be in PATH.
+- After setting up the softwares, you need to provide the absolute PATH to fastq files (PATH to the folder). Once you press "Scan Directory" button, it should show the exact names of the your fastq files. If names don't match, something is wrong with the PATH.
+- HIGHLY RECOMMENDED - Please make a backup of the raw data before running it using GUI. You wouldn't want to trust AI pipeline with the only copy of the data. Even, we don't.
+- Provide number of threads you want to use with FastQC command. Default is 8.
+- Provide the name of the MultiQC report you want to use. Default is `multiqc_report`.
+- Finally, you are at "Review & Run" step. This is the penultimate step before running quality check. Read all the details carefully. If everything looks good, proceed further. If not, you can always go back and change the parameters.
+- To look for your output files, we provide the directory structure at the Review step and once the analyses is finised. It might look something like this.
+
 # MetaQC Pipeline
 
 A web-based GUI for metagenomics quality control workflows on HPC clusters.  
