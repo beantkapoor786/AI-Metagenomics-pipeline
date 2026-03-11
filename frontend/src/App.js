@@ -1,11 +1,12 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
-import { sshConnect, scanDirectory, wsInstallTools, wsRunPipeline, healthCheck } from "./api";
+import { sshConnect, scanDirectory, downloadReports, wsInstallTools, wsRunPipeline, wsSetupBBDuk, wsRunPreprocessing, healthCheck } from "./api";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 const STEPS = [
   { id: "connect", label: "SSH Connection", icon: "🔗" },
   { id: "tools", label: "Tool Setup", icon: "🧰" },
   { id: "configure", label: "Configure", icon: "⚙️" },
+  { id: "bbduk_setup", label: "BBDuk Setup", icon: "✂️" },
   { id: "review", label: "Review & Run", icon: "🚀" },
   { id: "running", label: "Execution", icon: "📊" },
 ];
@@ -129,7 +130,7 @@ function LogViewer({ logs, expanded, onToggle, title, status }) {
   );
 }
 
-function DirTree({ rawDataPath }) {
+function DirTree({ rawDataPath, showBBDuk }) {
   const parent = rawDataPath ? rawDataPath.replace(/\/[^/]+\/?$/, "") : "/path/to/project";
   const rawName = rawDataPath ? rawDataPath.split("/").filter(Boolean).pop() : "raw_data";
   const items = [
@@ -142,6 +143,17 @@ function DirTree({ rawDataPath }) {
     { d:3,n:"multiqc_report/",icon:"📊",desc:"MultiQC HTML report" },
     { d:2,n:"logs/",icon:"📋",desc:"fastqc.log, multiqc.log" },
     { d:2,n:"scripts/",icon:"📜",desc:"Versioned run scripts" },
+    ...(showBBDuk ? [
+      { d:1,n:"2_reads_preprocessing/",icon:"📁",hl:true },
+      { d:2,n:"1_adapter_trimming_and_filtering/",icon:"📁",hl:true },
+      { d:3,n:"input/",icon:"📂",desc:"→ symlinked .fastq.gz" },
+      { d:3,n:"output/",icon:"📂" },
+      { d:4,n:"trimmed_reads/",icon:"✂️",desc:"BBDuk trimmed .fastq.gz" },
+      { d:4,n:"fastqc_reports/",icon:"📊",desc:"Post-trim FastQC" },
+      { d:4,n:"multiqc_report/",icon:"📊",desc:"Post-trim MultiQC" },
+      { d:3,n:"logs/",icon:"📋",desc:"bbduk.log, fastqc.log, multiqc.log" },
+      { d:3,n:"scripts/",icon:"📜",desc:"Versioned BBDuk script" },
+    ] : []),
   ];
   return (
     <div style={{ borderRadius:12,border:"1px solid rgba(255,255,255,.06)",background:"rgba(0,0,0,.25)",padding:"18px 22px",fontFamily:mono,fontSize:12 }}>
@@ -207,6 +219,41 @@ export default function App() {
   const [fX, setFX] = useState(true);
   const [mX, setMX] = useState(true);
   const [editMqc, setEditMqc] = useState(false);
+
+  // BBDuk
+  const [bbduk, setBBDuk] = useState({
+    enabled: true,
+    installed: null, // null = not chosen, true = installed, false = not installed
+    bbdukPath: "",   // path to bbduk.sh
+    bbmapDir: "",    // path to bbmap dir (auto-detected)
+    installPath: "", // where to install if not installed
+    adaptersPath: "", // auto-detected or custom
+    useCustomAdapters: false,
+    customAdapterPath: "",
+    // Parameters with sensible defaults
+    ktrim: "r", k: 23, mink: 11, hdist: 1,
+    qtrim: "rl", trimq: 20, minlen: 50, threads: 8,
+    trimmedSuffix: "_trimmed",
+    postTrimMqcName: "post_trim_multiqc_report",
+  });
+  const [bbdukSetupSt, setBBDukSetupSt] = useState(S.idle);
+  const [bbdukSetupLogs, setBBDukSetupLogs] = useState([]);
+  const [bbdukSetupX, setBBDukSetupX] = useState(true);
+
+  // BBDuk execution stages
+  const [bbSt, setBBSt] = useState(S.idle);
+  const [bbLogs, setBBLogs] = useState([]);
+  const [bbX, setBBX] = useState(true);
+  const [ptfSt, setPtfSt] = useState(S.idle);
+  const [ptfLogs, setPtfLogs] = useState([]);
+  const [ptfX, setPtfX] = useState(true);
+  const [ptmSt, setPtmSt] = useState(S.idle);
+  const [ptmLogs, setPtmLogs] = useState([]);
+  const [ptmX, setPtmX] = useState(true);
+
+  // Download
+  const [dlStatus, setDlStatus] = useState(S.idle); // idle | running | success | error
+  const [dlError, setDlError] = useState("");
 
   // Health check
   useEffect(()=>{
@@ -274,9 +321,35 @@ export default function App() {
     });
   };
 
+  // ── Setup BBDuk (WebSocket) ──
+  const handleBBDukSetup = () => {
+    setBBDukSetupSt(S.running); setBBDukSetupLogs([]);
+    const payload = {
+      session_id: sessionId,
+      installed: bbduk.installed,
+      bbduk_path: bbduk.bbdukPath,
+      install_path: bbduk.installPath,
+    };
+    wsSetupBBDuk(payload, (msg) => {
+      if (msg.type === "log") setBBDukSetupLogs(p => [...p, msg.message]);
+      if (msg.type === "status") {
+        setBBDukSetupSt(msg.status);
+        if (msg.status === "success") {
+          setBBDuk(p => ({
+            ...p,
+            bbmapDir: msg.bbmap_dir || p.bbmapDir,
+            bbdukPath: msg.bbduk_path || p.bbdukPath,
+            adaptersPath: msg.adapters_path || "",
+          }));
+        }
+      }
+    });
+  };
+
   // ── Run Pipeline (WebSocket) ──
   const handleRun = () => {
     setStep("running"); setFLogs([]); setMLogs([]); setFSt(S.running); setMSt(S.idle);
+    setBBLogs([]); setBBSt(S.idle); setPtfLogs([]); setPtfSt(S.idle); setPtmLogs([]); setPtmSt(S.idle);
     const payload = {
       session_id: sessionId,
       raw_data_path: pipe.rawDataPath,
@@ -286,29 +359,93 @@ export default function App() {
       conda_env_name: tool.condaEnvName,
       pixi_project_path: tool.pixiProjectPath,
       conda_use_mamba: tool.condaUseMamba,
+      run_bbduk: false,
     };
-    wsRunPipeline(payload, (msg)=>{
-      if(msg.type==="log") {
-        if(msg.stage==="fastqc") setFLogs(p=>[...p,msg.message]);
-        else setMLogs(p=>[...p,msg.message]);
+    wsRunPipeline(payload, (msg) => {
+      if (msg.type === "log") {
+        if (msg.stage === "fastqc") setFLogs(p => [...p, msg.message]);
+        else if (msg.stage === "multiqc") setMLogs(p => [...p, msg.message]);
       }
-      if(msg.type==="status") {
-        if(msg.stage==="fastqc") setFSt(msg.status);
-        else setMSt(msg.status);
+      if (msg.type === "status") {
+        if (msg.stage === "fastqc") setFSt(msg.status);
+        else if (msg.stage === "multiqc") setMSt(msg.status);
       }
     });
   };
 
+  // ── Run Preprocessing (separate step, user-triggered) ──
+  const handlePreprocessing = () => {
+    setBBLogs([]); setBBSt(S.running); setPtfLogs([]); setPtfSt(S.idle); setPtmLogs([]); setPtmSt(S.idle);
+    const payload = {
+      session_id: sessionId,
+      raw_data_path: pipe.rawDataPath,
+      fastqc_threads: pipe.fastqcThreads,
+      tool_method: tool.method,
+      conda_env_name: tool.condaEnvName,
+      pixi_project_path: tool.pixiProjectPath,
+      conda_use_mamba: tool.condaUseMamba,
+      bbduk_path: bbduk.bbdukPath,
+      bbmap_dir: bbduk.bbmapDir,
+      bbduk_adapter_path: bbduk.useCustomAdapters ? bbduk.customAdapterPath : "",
+      bbduk_ktrim: bbduk.ktrim,
+      bbduk_k: bbduk.k,
+      bbduk_mink: bbduk.mink,
+      bbduk_hdist: bbduk.hdist,
+      bbduk_qtrim: bbduk.qtrim,
+      bbduk_trimq: bbduk.trimq,
+      bbduk_minlen: bbduk.minlen,
+      bbduk_threads: bbduk.threads,
+      trimmed_suffix: bbduk.trimmedSuffix,
+      post_trim_multiqc_name: bbduk.postTrimMqcName,
+    };
+    wsRunPreprocessing(payload, (msg) => {
+      if (msg.type === "log") {
+        if (msg.stage === "bbduk") setBBLogs(p => [...p, msg.message]);
+        else if (msg.stage === "post_fastqc") setPtfLogs(p => [...p, msg.message]);
+        else if (msg.stage === "post_multiqc") setPtmLogs(p => [...p, msg.message]);
+      }
+      if (msg.type === "status") {
+        if (msg.stage === "bbduk") setBBSt(msg.status);
+        else if (msg.stage === "post_fastqc") setPtfSt(msg.status);
+        else if (msg.stage === "post_multiqc") setPtmSt(msg.status);
+      }
+    });
+  };
+
+  // ── Download Reports ──
+  const handleDownload = async () => {
+    setDlStatus(S.running); setDlError("");
+    try {
+      await downloadReports({
+        sessionId,
+        rawDataPath: pipe.rawDataPath,
+        multiqcName: pipe.multiqcName,
+        includePostTrim: bbduk.enabled && ptmSt === S.success,
+        postTrimMultiqcName: bbduk.postTrimMqcName,
+      });
+      setDlStatus(S.success);
+    } catch (e) {
+      setDlStatus(S.error);
+      setDlError(e.message);
+    }
+  };
+
   const canTools = tool.method && (tool.method==="path" || (tool.method==="conda"&&tool.condaEnvName) || (tool.method==="pixi"&&tool.pixiProjectPath)) && instStatus===S.success;
   const canReview = pipe.rawDataPath && pipe.multiqcName && files.length>0 && scanSt===S.success;
+  const canBBDukProceed = !bbduk.enabled || bbdukSetupSt===S.success;
 
   const toolLabel = tool.method==="conda"?`${tool.condaUseMamba?"Mamba":"Conda"} (${tool.condaEnvName})`:tool.method==="pixi"?`Pixi (${tool.pixiProjectPath})`:"System PATH";
+
+  const allDone = bbduk.enabled ? (fSt===S.success && mSt===S.success && bbSt===S.success && ptfSt===S.success && ptmSt===S.success) : (fSt===S.success && mSt===S.success);
 
   const resetAll = () => {
     setStep("connect"); setSshStatus(S.idle); setSessionId("");
     setSshLogs([]); setSshError(""); setInstStatus(S.idle); setInstLogs([]);
     setFiles([]); setPattern(""); setScanSt(S.idle); setScanErr("");
     setFSt(S.idle); setMSt(S.idle); setFLogs([]); setMLogs([]);
+    setBBSt(S.idle); setBBLogs([]); setPtfSt(S.idle); setPtfLogs([]);
+    setPtmSt(S.idle); setPtmLogs([]);
+    setBBDukSetupSt(S.idle); setBBDukSetupLogs([]);
   };
 
   return (
@@ -520,11 +657,155 @@ export default function App() {
               <div style={{ marginTop:10,fontSize:11,color:"rgba(255,255,255,.3)",fontFamily:mono }}>Output: <span style={{ color:"rgba(6,182,212,.7)" }}>analyses/1_QC/output/multiqc_report/{pipe.multiqcName||"..."}.html</span></div>
             </Card>
 
-            <div style={{ display:"flex",gap:12 }}><Back onClick={()=>setStep("tools")}/><Btn onClick={()=>setStep("review")} disabled={!canReview}>Review →</Btn></div>
+            <div style={{ display:"flex",gap:12 }}><Back onClick={()=>setStep("tools")}/><Btn onClick={()=>setStep("bbduk_setup")} disabled={!canReview}>BBDuk Setup →</Btn></div>
           </div>
         )}
 
-        {/* ═══ STEP 4: Review ═══ */}
+        {/* ═══ STEP 4: BBDuk Setup ═══ */}
+        {step==="bbduk_setup" && (
+          <div style={{ animation:"fadeIn .5s ease" }}>
+            <h2 style={{ margin:"0 0 6px",fontSize:26,fontWeight:700 }}>BBDuk Setup</h2>
+            <p style={{ margin:"0 0 28px",color:"rgba(255,255,255,.4)",fontSize:13 }}>Configure adapter trimming and quality filtering with BBDuk.</p>
+
+            {/* Enable/Disable toggle */}
+            <Card>
+              <CTitle icon="✂️">Enable BBDuk Preprocessing</CTitle>
+              <div style={{ display:"flex",alignItems:"center",gap:16 }}>
+                <label style={{ display:"flex",alignItems:"center",gap:10,cursor:"pointer",fontSize:14 }}>
+                  <input type="checkbox" checked={bbduk.enabled} onChange={e=>setBBDuk(p=>({...p,enabled:e.target.checked}))} style={{ accentColor:"#06b6d4",width:18,height:18 }}/>
+                  <span style={{ color:bbduk.enabled?"#e2e8f0":"rgba(255,255,255,.4)" }}>Run BBDuk adapter trimming & quality filtering after initial QC</span>
+                </label>
+              </div>
+              {bbduk.enabled && <p style={{ margin:"12px 0 0",fontSize:12,color:"rgba(255,255,255,.35)" }}>Post-trim FastQC + MultiQC will run automatically after BBDuk.</p>}
+            </Card>
+
+            {bbduk.enabled && (<>
+              {/* Installation status */}
+              <Card>
+                <CTitle icon="📦">BBDuk Installation</CTitle>
+                <div style={{ marginBottom:16 }}>
+                  <label style={{ fontSize:11,fontWeight:500,color:"rgba(255,255,255,.5)",letterSpacing:".08em",textTransform:"uppercase",display:"block",marginBottom:8 }}>Is BBDuk/BBMap already installed on the HPC?</label>
+                  <div style={{ display:"flex",gap:10 }}>
+                    {[{v:true,l:"✅ Yes, already installed"},{v:false,l:"📥 No, install it for me"}].map(o=>(
+                      <div key={String(o.v)} onClick={()=>{setBBDuk(p=>({...p,installed:o.v}));setBBDukSetupSt(S.idle);setBBDukSetupLogs([])}} style={{
+                        flex:1,padding:"14px 16px",borderRadius:10,cursor:"pointer",
+                        background:bbduk.installed===o.v?"rgba(6,182,212,.1)":"rgba(255,255,255,.02)",
+                        border:bbduk.installed===o.v?"1.5px solid rgba(6,182,212,.5)":"1px solid rgba(255,255,255,.06)",
+                        boxShadow:bbduk.installed===o.v?"0 0 16px rgba(6,182,212,.1)":"none",
+                      }}>
+                        <div style={{ fontSize:13,fontWeight:600,color:bbduk.installed===o.v?"#06b6d4":"#e2e8f0" }}>{o.l}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {bbduk.installed===true && (
+                  <div style={{ animation:"fadeIn .2s ease" }}>
+                    <Input label="Path to bbduk.sh" value={bbduk.bbdukPath}
+                      onChange={v=>setBBDuk(p=>({...p,bbdukPath:v}))}
+                      placeholder="/path/to/bbmap/bbduk.sh" required isMono
+                      hint="Full path to the bbduk.sh script"/>
+                  </div>
+                )}
+
+                {bbduk.installed===false && (
+                  <div style={{ animation:"fadeIn .2s ease" }}>
+                    <Input label="Installation directory" value={bbduk.installPath}
+                      onChange={v=>setBBDuk(p=>({...p,installPath:v}))}
+                      placeholder="/home/user/software" required isMono
+                      hint="BBMap will be downloaded and extracted here (creates bbmap/ subdirectory)"/>
+                  </div>
+                )}
+
+                {bbduk.installed!==null && (
+                  <div style={{ marginTop:16 }}>
+                    {bbdukSetupSt!==S.success && (
+                      <Btn onClick={handleBBDukSetup}
+                        disabled={bbdukSetupSt===S.running || (bbduk.installed && !bbduk.bbdukPath) || (!bbduk.installed && !bbduk.installPath)}>
+                        {bbdukSetupSt===S.running?"⟳ Working…":bbduk.installed?"🔍 Verify BBDuk":"📥 Download & Install BBMap"}
+                      </Btn>
+                    )}
+                    {bbdukSetupLogs.length>0 && (
+                      <div style={{ marginTop:12 }}>
+                        <LogViewer title="BBDuk Setup" logs={bbdukSetupLogs} status={bbdukSetupSt} expanded={bbdukSetupX} onToggle={()=>setBBDukSetupX(p=>!p)}/>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </Card>
+
+              {/* Adapter config - show after setup success */}
+              {bbdukSetupSt===S.success && (
+                <Card style={{ animation:"fadeIn .3s ease" }}>
+                  <CTitle icon="🧬">Adapter Reference</CTitle>
+                  <div style={{ display:"flex",alignItems:"center",gap:12,marginBottom:16 }}>
+                    <label style={{ display:"flex",alignItems:"center",gap:8,cursor:"pointer",fontSize:13,color:"#e2e8f0" }}>
+                      <input type="checkbox" checked={bbduk.useCustomAdapters} onChange={e=>setBBDuk(p=>({...p,useCustomAdapters:e.target.checked}))} style={{ accentColor:"#06b6d4",width:16,height:16 }}/>
+                      Use custom adapter file
+                    </label>
+                  </div>
+                  {!bbduk.useCustomAdapters ? (
+                    <div style={{ padding:"10px 14px",borderRadius:10,background:"rgba(16,185,129,.06)",border:"1px solid rgba(16,185,129,.15)",fontSize:12,color:"#10b981",fontFamily:mono }}>
+                      ✓ Using built-in: {bbduk.adaptersPath || `${bbduk.bbmapDir}/resources/adapters.fa`}
+                    </div>
+                  ) : (
+                    <Input label="Custom adapter FASTA path" value={bbduk.customAdapterPath}
+                      onChange={v=>setBBDuk(p=>({...p,customAdapterPath:v}))}
+                      placeholder="/path/to/custom_adapters.fa" required isMono/>
+                  )}
+                </Card>
+              )}
+
+              {/* BBDuk parameters - show after setup success */}
+              {bbdukSetupSt===S.success && (
+                <Card style={{ animation:"fadeIn .3s ease" }}>
+                  <CTitle icon="🔧">BBDuk Parameters</CTitle>
+                  <p style={{ margin:"0 0 16px",fontSize:12,color:"rgba(255,255,255,.35)" }}>Sensible defaults are pre-filled. Edit as needed.</p>
+
+                  <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:14,marginBottom:16 }}>
+                    {[
+                      {l:"ktrim",v:bbduk.ktrim,k:"ktrim",h:"Trim direction (r=right, l=left)",type:"text"},
+                      {l:"k (kmer length)",v:bbduk.k,k:"k",h:"Kmer length for matching",type:"number"},
+                      {l:"mink",v:bbduk.mink,k:"mink",h:"Min kmer length at ends",type:"number"},
+                      {l:"hdist",v:bbduk.hdist,k:"hdist",h:"Hamming distance for matching",type:"number"},
+                      {l:"qtrim",v:bbduk.qtrim,k:"qtrim",h:"Quality trim direction (rl=both)",type:"text"},
+                      {l:"trimq",v:bbduk.trimq,k:"trimq",h:"Quality trim threshold",type:"number"},
+                      {l:"minlen",v:bbduk.minlen,k:"minlen",h:"Min read length after trim",type:"number"},
+                    ].map(p=>(
+                      <Input key={p.k} label={p.l} value={String(p.v)} type={p.type}
+                        onChange={v=>setBBDuk(prev=>({...prev,[p.k]:p.type==="number"?Number(v):v}))}
+                        hint={p.h} isMono/>
+                    ))}
+                  </div>
+
+                  <NumField label="BBDuk Threads" value={bbduk.threads}
+                    onChange={v=>setBBDuk(p=>({...p,threads:v}))} def={8}/>
+
+                  <div style={{ marginTop:16 }}>
+                    <Input label="Trimmed File Suffix" value={bbduk.trimmedSuffix}
+                      onChange={v=>setBBDuk(p=>({...p,trimmedSuffix:v}))}
+                      placeholder="_trimmed" isMono
+                      hint={`Output example: sample_28_R1${bbduk.trimmedSuffix || "_trimmed"}.fastq.gz`}/>
+                  </div>
+
+                  <div style={{ marginTop:16 }}>
+                    <Input label="Post-trim MultiQC Report Name" value={bbduk.postTrimMqcName}
+                      onChange={v=>setBBDuk(p=>({...p,postTrimMqcName:v}))}
+                      placeholder="post_trim_multiqc_report" isMono
+                      hint="Name for the MultiQC report on trimmed reads (without .html)"/>
+                  </div>
+                </Card>
+              )}
+            </>)}
+
+            <div style={{ display:"flex",gap:12,marginTop:6 }}>
+              <Back onClick={()=>setStep("configure")}/>
+              <Btn onClick={()=>setStep("review")} disabled={bbduk.enabled && !canBBDukProceed}>Review & Run →</Btn>
+            </div>
+          </div>
+        )}
+
+        {/* ═══ STEP 5: Review ═══ */}
         {step==="review" && (
           <div style={{ animation:"fadeIn .5s ease" }}>
             <h2 style={{ margin:"0 0 6px",fontSize:26,fontWeight:700 }}>Review & Launch</h2>
@@ -532,7 +813,20 @@ export default function App() {
             <Card>
               <CTitle icon="📋">Summary</CTitle>
               <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:12 }}>
-                {[{l:"HPC",v:`${ssh.hostname}:${ssh.port}`},{l:"User",v:ssh.username},{l:"Auth",v:ssh.authMethod==="password"?"Password":`Key (${ssh.keyPath})`},{l:"Tools",v:toolLabel},{l:"Data",v:pipe.rawDataPath},{l:"Files",v:`${files.length} files`},{l:"FastQC Threads",v:`${pipe.fastqcThreads}`},{l:"MultiQC Report",v:`${pipe.multiqcName}.html`}].map((it,i)=>(
+                {[
+                  {l:"HPC",v:`${ssh.hostname}:${ssh.port}`},{l:"User",v:ssh.username},
+                  {l:"Auth",v:ssh.authMethod==="password"?"Password":`Key (${ssh.keyPath})`},
+                  {l:"Tools",v:toolLabel},
+                  {l:"Data",v:pipe.rawDataPath},{l:"Files",v:`${files.length} files`},
+                  {l:"FastQC Threads",v:`${pipe.fastqcThreads}`},{l:"MultiQC Report",v:`${pipe.multiqcName}.html`},
+                  ...(bbduk.enabled ? [
+                    {l:"BBDuk",v:"Enabled"},
+                    {l:"BBDuk Path",v:bbduk.bbdukPath || `${bbduk.bbmapDir}/bbduk.sh`},
+                    {l:"Adapters",v:bbduk.useCustomAdapters?bbduk.customAdapterPath:"Built-in adapters.fa"},
+                    {l:"BBDuk Params",v:`ktrim=${bbduk.ktrim} k=${bbduk.k} mink=${bbduk.mink} hdist=${bbduk.hdist} qtrim=${bbduk.qtrim} trimq=${bbduk.trimq} minlen=${bbduk.minlen} t=${bbduk.threads}`},
+                    {l:"Post-trim Report",v:`${bbduk.postTrimMqcName}.html`},
+                  ] : [{l:"BBDuk",v:"Disabled"}]),
+                ].map((it,i)=>(
                   <div key={i} style={{ padding:"10px 14px",borderRadius:10,background:"rgba(0,0,0,.2)",border:"1px solid rgba(255,255,255,.04)" }}>
                     <div style={{ fontSize:10,color:"rgba(255,255,255,.3)",textTransform:"uppercase",letterSpacing:".06em",marginBottom:3 }}>{it.l}</div>
                     <div style={{ fontSize:12,color:"#e2e8f0",fontFamily:mono,wordBreak:"break-all" }}>{it.v}</div>
@@ -540,7 +834,7 @@ export default function App() {
                 ))}
               </div>
             </Card>
-            <Card><CTitle icon="🌳">Directory Structure</CTitle><DirTree rawDataPath={pipe.rawDataPath}/></Card>
+            <Card><CTitle icon="🌳">Directory Structure</CTitle><DirTree rawDataPath={pipe.rawDataPath} showBBDuk={bbduk.enabled}/></Card>
 
             {/* Exact commands preview */}
             {(() => {
@@ -564,6 +858,15 @@ export default function App() {
               }
               const fullFqc = `${fqcCmd} --threads ${pipe.fastqcThreads} --outdir "${qc}/output/fastqc_reports" "${qc}/input"/*.fastq.gz`;
               const fullMqc = `${mqcCmd} "${qc}/output/fastqc_reports" --outdir "${qc}/output/multiqc_report" --filename "${pipe.multiqcName}" --force`;
+
+              const preproc = `${parent}/analyses/2_Read_Preprocessing`;
+              const postQc = `${parent}/analyses/3_PostTrim_QC`;
+              const bbdukSh = bbduk.bbdukPath || `${bbduk.bbmapDir}/bbduk.sh`;
+              const adapterRef = bbduk.useCustomAdapters ? bbduk.customAdapterPath : (bbduk.adaptersPath || `${bbduk.bbmapDir}/resources/adapters.fa`);
+              const fullBBDuk = `bash "${bbdukSh}" in1=<R1>.fastq.gz in2=<R2>.fastq.gz out1=<R1>_trimmed.fastq.gz out2=<R2>_trimmed.fastq.gz ref="${adapterRef}" ktrim=${bbduk.ktrim} k=${bbduk.k} mink=${bbduk.mink} hdist=${bbduk.hdist} qtrim=${bbduk.qtrim} trimq=${bbduk.trimq} minlen=${bbduk.minlen} threads=${bbduk.threads} tpe tbo`;
+              const fullPostFqc = `${fqcCmd} --threads ${pipe.fastqcThreads} --outdir "${postQc}/output/fastqc_reports" "${postQc}/input"/*.fastq.gz`;
+              const fullPostMqc = `${mqcCmd} "${postQc}/output/fastqc_reports" --outdir "${postQc}/output/multiqc_report" --filename "${bbduk.postTrimMqcName}" --force`;
+
               const cmdBlockStyle = {
                 padding: "12px 16px", borderRadius: 10, background: "rgba(0,0,0,.3)",
                 border: "1px solid rgba(255,255,255,.06)", fontFamily: mono, fontSize: 11,
@@ -584,13 +887,27 @@ export default function App() {
                     </div>
                   )}
                   <div style={{ marginBottom: 14 }}>
-                    <div style={labelStyle}>FastQC Command</div>
+                    <div style={labelStyle}>1. FastQC Command</div>
                     <div style={cmdBlockStyle}>$ {fullFqc}</div>
                   </div>
-                  <div style={{ marginBottom: 0 }}>
-                    <div style={labelStyle}>MultiQC Command (runs automatically after FastQC)</div>
+                  <div style={{ marginBottom: bbduk.enabled ? 14 : 0 }}>
+                    <div style={labelStyle}>2. MultiQC Command (auto after FastQC)</div>
                     <div style={cmdBlockStyle}>$ {fullMqc}</div>
                   </div>
+                  {bbduk.enabled && (<>
+                    <div style={{ marginBottom: 14 }}>
+                      <div style={labelStyle}>3. BBDuk Command (per sample pair)</div>
+                      <div style={cmdBlockStyle}>$ {fullBBDuk}</div>
+                    </div>
+                    <div style={{ marginBottom: 14 }}>
+                      <div style={labelStyle}>4. Post-trim FastQC (auto after BBDuk)</div>
+                      <div style={cmdBlockStyle}>$ {fullPostFqc}</div>
+                    </div>
+                    <div style={{ marginBottom: 0 }}>
+                      <div style={labelStyle}>5. Post-trim MultiQC (auto after post-trim FastQC)</div>
+                      <div style={cmdBlockStyle}>$ {fullPostMqc}</div>
+                    </div>
+                  </>)}
                 </Card>
               );
             })()}
@@ -604,21 +921,23 @@ export default function App() {
               {!editMqc&&<button onClick={()=>setEditMqc(true)} style={{ padding:"7px 14px",borderRadius:8,border:"1px solid rgba(245,158,11,.2)",background:"rgba(245,158,11,.1)",color:"#f59e0b",fontSize:12,cursor:"pointer" }}>Edit</button>}
             </div>
 
-            <div style={{ display:"flex",gap:12 }}><Back onClick={()=>setStep("configure")}/><Btn onClick={handleRun} color="green" style={{ fontSize:15,fontWeight:700,padding:16 }}>🚀 Start FastQC Analysis</Btn></div>
+            <div style={{ display:"flex",gap:12 }}><Back onClick={()=>setStep("bbduk_setup")}/><Btn onClick={handleRun} color="green" style={{ fontSize:15,fontWeight:700,padding:16 }}>🚀 Start Pipeline</Btn></div>
           </div>
         )}
 
-        {/* ═══ STEP 5: Execution ═══ */}
+        {/* ═══ STEP 6: Execution ═══ */}
         {step==="running" && (
           <div style={{ animation:"fadeIn .5s ease" }}>
             <h2 style={{ margin:"0 0 6px",fontSize:26,fontWeight:700 }}>Pipeline Execution</h2>
-            <p style={{ margin:"0 0 28px",color:"rgba(255,255,255,.4)",fontSize:13 }}>{fSt===S.success&&mSt===S.success?"All analyses completed!":"Monitoring progress…"}</p>
+            <p style={{ margin:"0 0 28px",color:"rgba(255,255,255,.4)",fontSize:13 }}>{allDone?"All analyses completed!":"Monitoring progress…"}</p>
 
+            {/* QC Status Cards */}
+            <div style={{ marginBottom:8,fontSize:12,fontWeight:600,color:"rgba(255,255,255,.4)",textTransform:"uppercase",letterSpacing:".06em" }}>Step 1: Quality Check</div>
             <div style={{ display:"flex",gap:12,marginBottom:20 }}>
               {[{l:"FastQC",s:fSt},{l:"MultiQC",s:mSt}].map((x,i)=>(
-                <div key={i} style={{ flex:1,padding:"14px 18px",borderRadius:14,textAlign:"center",background:x.s===S.success?"rgba(16,185,129,.08)":x.s===S.running?"rgba(245,158,11,.08)":"rgba(255,255,255,.02)",border:`1px solid ${x.s===S.success?"rgba(16,185,129,.2)":x.s===S.running?"rgba(245,158,11,.2)":"rgba(255,255,255,.06)"}` }}>
-                  <div style={{ fontSize:26,marginBottom:4,animation:x.s===S.running?"pulse 1.5s infinite":"none" }}>{x.s===S.success?"✅":x.s===S.running?"⏳":"⏸"}</div>
-                  <div style={{ fontSize:13,fontWeight:600,color:x.s===S.success?"#10b981":x.s===S.running?"#f59e0b":"rgba(255,255,255,.3)" }}>{x.l}</div>
+                <div key={i} style={{ flex:1,padding:"12px 14px",borderRadius:14,textAlign:"center",background:x.s===S.success?"rgba(16,185,129,.08)":x.s===S.running?"rgba(245,158,11,.08)":x.s===S.error?"rgba(244,63,94,.08)":"rgba(255,255,255,.02)",border:`1px solid ${x.s===S.success?"rgba(16,185,129,.2)":x.s===S.running?"rgba(245,158,11,.2)":x.s===S.error?"rgba(244,63,94,.2)":"rgba(255,255,255,.06)"}` }}>
+                  <div style={{ fontSize:22,marginBottom:2,animation:x.s===S.running?"pulse 1.5s infinite":"none" }}>{x.s===S.success?"✅":x.s===S.running?"⏳":x.s===S.error?"❌":"⏸"}</div>
+                  <div style={{ fontSize:11,fontWeight:600,color:x.s===S.success?"#10b981":x.s===S.running?"#f59e0b":x.s===S.error?"#f43f5e":"rgba(255,255,255,.3)" }}>{x.l}</div>
                 </div>
               ))}
             </div>
@@ -628,16 +947,94 @@ export default function App() {
               <LogViewer title="MultiQC Execution (auto-triggered)" logs={mLogs} status={mSt} expanded={mX} onToggle={()=>setMX(p=>!p)}/>
             </div>
 
-            {fSt===S.success&&mSt===S.success&&(
+            {/* Preprocessing Section — appears after QC completes */}
+            {fSt===S.success && mSt===S.success && bbduk.enabled && (
+              <div style={{ marginTop:28,animation:"fadeIn .5s ease" }}>
+                <div style={{ marginBottom:8,fontSize:12,fontWeight:600,color:"rgba(255,255,255,.4)",textTransform:"uppercase",letterSpacing:".06em" }}>Step 2: Reads Preprocessing</div>
+
+                {/* Preprocessing Status Cards */}
+                <div style={{ display:"flex",gap:12,marginBottom:20,flexWrap:"wrap" }}>
+                  {[{l:"BBDuk Trimming",s:bbSt},{l:"Post-trim FastQC",s:ptfSt},{l:"Post-trim MultiQC",s:ptmSt}].map((x,i)=>(
+                    <div key={i} style={{ flex:"1 1 auto",minWidth:100,padding:"12px 14px",borderRadius:14,textAlign:"center",background:x.s===S.success?"rgba(16,185,129,.08)":x.s===S.running?"rgba(245,158,11,.08)":x.s===S.error?"rgba(244,63,94,.08)":"rgba(255,255,255,.02)",border:`1px solid ${x.s===S.success?"rgba(16,185,129,.2)":x.s===S.running?"rgba(245,158,11,.2)":x.s===S.error?"rgba(244,63,94,.2)":"rgba(255,255,255,.06)"}` }}>
+                      <div style={{ fontSize:22,marginBottom:2,animation:x.s===S.running?"pulse 1.5s infinite":"none" }}>{x.s===S.success?"✅":x.s===S.running?"⏳":x.s===S.error?"❌":"⏸"}</div>
+                      <div style={{ fontSize:11,fontWeight:600,color:x.s===S.success?"#10b981":x.s===S.running?"#f59e0b":x.s===S.error?"#f43f5e":"rgba(255,255,255,.3)" }}>{x.l}</div>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Start Preprocessing Button — only if not yet started */}
+                {bbSt===S.idle && (
+                  <div style={{ marginBottom:20 }}>
+                    <Btn onClick={handlePreprocessing} color="green" style={{ fontSize:14,fontWeight:700,padding:14 }}>
+                      ✂️ Start Preprocessing (BBDuk + Post-trim QC)
+                    </Btn>
+                  </div>
+                )}
+
+                {/* Preprocessing Log Viewers */}
+                {bbSt!==S.idle && (
+                  <div style={{ display:"flex",flexDirection:"column",gap:14 }}>
+                    <LogViewer title="BBDuk Adapter Trimming & Quality Filtering" logs={bbLogs} status={bbSt} expanded={bbX} onToggle={()=>setBBX(p=>!p)}/>
+                    <LogViewer title="Post-trim FastQC" logs={ptfLogs} status={ptfSt} expanded={ptfX} onToggle={()=>setPtfX(p=>!p)}/>
+                    <LogViewer title="Post-trim MultiQC (auto-triggered)" logs={ptmLogs} status={ptmSt} expanded={ptmX} onToggle={()=>setPtmX(p=>!p)}/>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Completion Summary */}
+            {allDone&&(
               <div style={{ marginTop:24,padding:"22px 24px",borderRadius:16,background:"linear-gradient(135deg,rgba(16,185,129,.06),rgba(6,182,212,.06))",border:"1px solid rgba(16,185,129,.15)",animation:"fadeIn .5s ease" }}>
-                <h3 style={{ margin:"0 0 14px",fontSize:17,fontWeight:700,color:"#10b981" }}>✓ QC Pipeline Complete</h3>
-                <DirTree rawDataPath={pipe.rawDataPath}/>
+                <h3 style={{ margin:"0 0 14px",fontSize:17,fontWeight:700,color:"#10b981" }}>✓ Pipeline Complete</h3>
+                <DirTree rawDataPath={pipe.rawDataPath} showBBDuk={bbduk.enabled}/>
                 <div style={{ marginTop:14,padding:"10px 14px",borderRadius:10,background:"rgba(0,0,0,.2)",fontFamily:mono,fontSize:11,color:"rgba(255,255,255,.45)",lineHeight:1.8 }}>
                   <div>📊 FastQC: analyses/1_QC/output/fastqc_reports/</div>
                   <div>📊 MultiQC: analyses/1_QC/output/multiqc_report/{pipe.multiqcName}.html</div>
-                  <div>📋 Logs: analyses/1_QC/logs/</div>
-                  <div>📜 Scripts: analyses/1_QC/scripts/</div>
+                  {bbduk.enabled && ptmSt===S.success && (<>
+                    <div>✂️ Trimmed: analyses/2_reads_preprocessing/1_adapter_trimming_and_filtering/output/trimmed_reads/</div>
+                    <div>📊 Post-trim FastQC: .../1_adapter_trimming_and_filtering/output/fastqc_reports/</div>
+                    <div>📊 Post-trim MultiQC: .../1_adapter_trimming_and_filtering/output/multiqc_report/{bbduk.postTrimMqcName}.html</div>
+                  </>)}
+                  <div>📋 Logs: analyses/*/logs/</div>
+                  <div>📜 Scripts: analyses/*/scripts/</div>
                 </div>
+
+                {/* Download MultiQC Reports */}
+                <div style={{ marginTop:18,padding:"18px 20px",borderRadius:14,background:"linear-gradient(135deg,rgba(6,182,212,.06),rgba(6,182,212,.1))",border:"1px solid rgba(6,182,212,.2)" }}>
+                  <div style={{ display:"flex",alignItems:"center",gap:10,marginBottom:12 }}>
+                    <span style={{ fontSize:18 }}>📥</span>
+                    <div>
+                      <div style={{ fontSize:14,fontWeight:600,color:"#06b6d4" }}>Download MultiQC Reports</div>
+                      <div style={{ fontSize:11,color:"rgba(255,255,255,.4)",marginTop:2 }}>
+                        {bbduk.enabled && ptmSt===S.success
+                          ? `Includes: ${pipe.multiqcName}.html + ${bbduk.postTrimMqcName}.html`
+                          : `Includes: ${pipe.multiqcName}.html`}
+                      </div>
+                    </div>
+                  </div>
+                  <button onClick={handleDownload}
+                    disabled={dlStatus===S.running}
+                    style={{
+                      width:"100%",padding:"12px",borderRadius:10,border:"none",
+                      background:dlStatus===S.success?"linear-gradient(135deg,#10b981,#059669)":dlStatus===S.running?"rgba(245,158,11,.2)":"linear-gradient(135deg,#06b6d4,#0891b2)",
+                      color:"#fff",fontSize:14,fontWeight:600,cursor:dlStatus===S.running?"wait":"pointer",
+                      boxShadow:dlStatus===S.running?"none":"0 4px 16px rgba(6,182,212,.25)",
+                      transition:"all .3s ease",
+                    }}>
+                    {dlStatus===S.running?"⟳ Fetching reports from HPC...":dlStatus===S.success?"✓ Downloaded! Check your downloads folder":"📥 Download MultiQC Reports (.zip)"}
+                  </button>
+                  {dlStatus===S.error && (
+                    <div style={{ marginTop:8,padding:"8px 12px",borderRadius:8,background:"rgba(244,63,94,.08)",border:"1px solid rgba(244,63,94,.15)",fontSize:11,color:"#f43f5e" }}>
+                      ✗ {dlError}
+                    </div>
+                  )}
+                  {dlStatus===S.success && (
+                    <button onClick={()=>setDlStatus(S.idle)} style={{ marginTop:8,padding:"6px 14px",borderRadius:8,border:"1px solid rgba(255,255,255,.1)",background:"rgba(255,255,255,.03)",color:"rgba(255,255,255,.5)",fontSize:11,cursor:"pointer" }}>
+                      Download again
+                    </button>
+                  )}
+                </div>
+
                 <button onClick={resetAll} style={{ marginTop:14,padding:"10px 20px",borderRadius:10,border:"1px solid rgba(6,182,212,.2)",background:"rgba(6,182,212,.08)",color:"#06b6d4",fontSize:13,fontWeight:500,cursor:"pointer" }}>↻ New Analysis</button>
               </div>
             )}

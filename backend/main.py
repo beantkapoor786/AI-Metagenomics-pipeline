@@ -6,16 +6,19 @@ All blocking SSH calls run in thread pool to avoid blocking async loop.
 
 import asyncio
 import functools
+import io
 import json
 import logging
 import os
 import uuid
+import zipfile
 from contextlib import asynccontextmanager
 from typing import Optional
 
 import paramiko
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO)
@@ -82,6 +85,27 @@ class RunPipelinePayload(BaseModel):
     conda_env_name: str = ""
     pixi_project_path: str = ""
     conda_use_mamba: bool = False
+    # BBDuk settings
+    run_bbduk: bool = False
+    bbduk_path: str = ""  # path to bbduk.sh (or empty if in PATH)
+    bbmap_dir: str = ""   # path to bbmap install dir (for adapters.fa)
+    bbduk_adapter_path: str = ""  # custom adapter file, empty = use built-in
+    bbduk_ktrim: str = "r"
+    bbduk_k: int = 23
+    bbduk_mink: int = 11
+    bbduk_hdist: int = 1
+    bbduk_qtrim: str = "rl"
+    bbduk_trimq: int = 20
+    bbduk_minlen: int = 50
+    bbduk_threads: int = 8
+    post_trim_multiqc_name: str = "post_trim_multiqc_report"
+
+
+class SetupBBDukPayload(BaseModel):
+    session_id: str
+    installed: bool = False        # True = already installed
+    bbduk_path: str = ""           # path to bbduk.sh if installed
+    install_path: str = ""         # where to download bbmap if not installed
 
 
 # Helpers
@@ -288,6 +312,74 @@ async def scan_directory(req: ScanDirectoryRequest):
             detected = label
             break
     return {"files": files, "count": len(files), "pattern": detected, "path": req.path}
+
+
+# Download MultiQC Reports
+
+class DownloadReportsRequest(BaseModel):
+    session_id: str
+    raw_data_path: str
+    multiqc_name: str = "multiqc_report"
+    include_post_trim: bool = False
+    post_trim_multiqc_name: str = "post_trim_multiqc_report"
+
+
+@app.post("/api/download-reports")
+async def download_reports(req: DownloadReportsRequest):
+    """Fetch MultiQC HTML reports from HPC via SFTP and return as a zip."""
+    client = get_client(req.session_id)
+
+    raw = req.raw_data_path.rstrip("/")
+    parent = os.path.dirname(raw)
+
+    # Collect report paths to download
+    reports = []
+
+    # 1_QC MultiQC report
+    qc_report = f"{parent}/analyses/1_QC/output/multiqc_report/{req.multiqc_name}.html"
+    reports.append(("1_QC_multiqc", qc_report))
+
+    # Post-trim MultiQC report (if preprocessing was run)
+    if req.include_post_trim:
+        pt_report = f"{parent}/analyses/2_reads_preprocessing/1_adapter_trimming_and_filtering/output/multiqc_report/{req.post_trim_multiqc_name}.html"
+        reports.append(("post_trim_multiqc", pt_report))
+
+    # Open SFTP and read files
+    loop = asyncio.get_event_loop()
+
+    def _build_zip():
+        sftp = client.open_sftp()
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for label, remote_path in reports:
+                try:
+                    with sftp.open(remote_path, "r") as rf:
+                        data = rf.read()
+                    filename = os.path.basename(remote_path)
+                    # Prefix with label to avoid name collisions
+                    zf.writestr(f"{label}/{filename}", data)
+                    logger.info(f"Added to zip: {label}/{filename}")
+                except FileNotFoundError:
+                    logger.warning(f"Report not found: {remote_path}")
+                    # Add a note file instead
+                    zf.writestr(f"{label}/NOT_FOUND.txt", f"Report not found on HPC:\n{remote_path}")
+                except Exception as e:
+                    logger.error(f"Error reading {remote_path}: {e}")
+                    zf.writestr(f"{label}/ERROR.txt", f"Error reading report:\n{remote_path}\n{str(e)}")
+        sftp.close()
+        buf.seek(0)
+        return buf
+
+    try:
+        zip_buf = await loop.run_in_executor(None, _build_zip)
+    except Exception as e:
+        raise HTTPException(500, f"Failed to fetch reports: {str(e)}")
+
+    return StreamingResponse(
+        zip_buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": "attachment; filename=multiqc_reports.zip"},
+    )
 
 
 # WebSocket: Install Tools
@@ -506,6 +598,150 @@ async def ws_install_tools(websocket: WebSocket):
             pass
 
 
+# WebSocket: Setup BBDuk
+
+@app.websocket("/ws/setup-bbduk")
+async def ws_setup_bbduk(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        data = await websocket.receive_json()
+        req = SetupBBDukPayload(**data)
+        client = get_client(req.session_id)
+
+        async def log(msg, lvl="info"):
+            await websocket.send_json({"type": "log", "message": msg, "level": lvl})
+
+        async def set_status(s, **extra):
+            await websocket.send_json({"type": "status", "status": s, **extra})
+
+        await set_status("running")
+
+        if req.installed:
+            # Verify existing bbduk.sh
+            bbduk = req.bbduk_path.rstrip("/")
+            await log(f">>> Verifying BBDuk at: {bbduk}")
+            out, err, code = await ssh_exec(client, f'test -f "{bbduk}" && echo "FOUND" || echo "MISSING"')
+            if "MISSING" in out:
+                await log(f"✗ bbduk.sh not found at {bbduk}", "error")
+                await set_status("error")
+                return
+            await log("✓ bbduk.sh found")
+
+            # Test it runs
+            await log(">>> Testing bbduk.sh...")
+            out, err, code = await ssh_exec(client, f'bash "{bbduk}" --version 2>&1 | head -3', timeout=30)
+            if out.strip():
+                for line in out.strip().split("\n")[:3]:
+                    await log(f"  {line.strip()}")
+            await log("✓ BBDuk is functional", "success")
+
+            # Find bbmap dir (parent of bbduk.sh) for adapters.fa
+            bbmap_dir = os.path.dirname(bbduk)
+            adapters = f"{bbmap_dir}/resources/adapters.fa"
+            await log(f">>> Checking built-in adapters at: {adapters}")
+            out, _, _ = await ssh_exec(client, f'test -f "{adapters}" && echo "FOUND" || echo "MISSING"')
+            if "FOUND" in out:
+                await log("✓ adapters.fa found", "success")
+            else:
+                await log("⚠ adapters.fa not found — you'll need to provide a custom adapter file", "info")
+                adapters = ""
+
+            await log("")
+            await log("SUCCESS BBDuk verified!", "success")
+            await set_status("success", bbmap_dir=bbmap_dir, bbduk_path=bbduk, adapters_path=adapters)
+
+        else:
+            # Download and install BBMap/BBDuk
+            install_dir = req.install_path.rstrip("/")
+            await log(f">>> Installing BBMap suite to: {install_dir}")
+            await log(f"$ mkdir -p \"{install_dir}\"")
+            _, err, code = await ssh_exec(client, f'mkdir -p "{install_dir}"')
+            if code != 0:
+                await log(f"✗ Failed to create directory: {err.strip()}", "error")
+                await set_status("error")
+                return
+            await log("✓ Directory created")
+            await log("")
+
+            # Download latest BBMap
+            await log(">>> Downloading BBMap from SourceForge...")
+            dl_url = "https://sourceforge.net/projects/bbmap/files/latest/download"
+            dl_cmd = f'cd "{install_dir}" && curl -L -o bbmap.tar.gz "{dl_url}" 2>&1'
+            await log(f"$ curl -L -o bbmap.tar.gz {dl_url}")
+
+            loop = asyncio.get_event_loop()
+            ch = await loop.run_in_executor(None, client.get_transport().open_session)
+            ch.settimeout(600)
+            await loop.run_in_executor(None, ch.exec_command, dl_cmd)
+            exit_code, _ = await stream_channel_async(ch, websocket, "bbduk_install")
+            await loop.run_in_executor(None, ch.close)
+
+            if exit_code != 0:
+                await log("✗ Download failed", "error")
+                await set_status("error")
+                return
+            await log("✓ Download complete")
+            await log("")
+
+            # Extract
+            await log(">>> Extracting BBMap...")
+            ext_cmd = f'cd "{install_dir}" && tar -xzf bbmap.tar.gz 2>&1'
+            await log(f"$ tar -xzf bbmap.tar.gz")
+            out, err, code = await ssh_exec(client, ext_cmd, timeout=120)
+            if code != 0:
+                await log(f"✗ Extraction failed: {err.strip()}", "error")
+                await set_status("error")
+                return
+            await log("✓ Extracted")
+
+            # Clean up tarball
+            await ssh_exec(client, f'rm -f "{install_dir}/bbmap.tar.gz"')
+            await log("")
+
+            # Verify
+            bbmap_dir = f"{install_dir}/bbmap"
+            bbduk_path = f"{bbmap_dir}/bbduk.sh"
+            await log(f">>> Verifying installation at: {bbduk_path}")
+            out, _, code = await ssh_exec(client, f'test -f "{bbduk_path}" && echo "FOUND" || echo "MISSING"')
+            if "MISSING" in out or code != 0:
+                await log("✗ bbduk.sh not found after extraction", "error")
+                await set_status("error")
+                return
+            await log("✓ bbduk.sh found")
+
+            out, _, _ = await ssh_exec(client, f'bash "{bbduk_path}" --version 2>&1 | head -3', timeout=30)
+            if out.strip():
+                for line in out.strip().split("\n")[:3]:
+                    await log(f"  {line.strip()}")
+
+            adapters = f"{bbmap_dir}/resources/adapters.fa"
+            out, _, _ = await ssh_exec(client, f'test -f "{adapters}" && echo "FOUND" || echo "MISSING"')
+            if "FOUND" in out:
+                await log("✓ Built-in adapters.fa found", "success")
+            else:
+                adapters = ""
+                await log("⚠ adapters.fa not found", "info")
+
+            await log("")
+            await log("SUCCESS BBMap/BBDuk installed!", "success")
+            await set_status("success", bbmap_dir=bbmap_dir, bbduk_path=bbduk_path, adapters_path=adapters)
+
+    except WebSocketDisconnect:
+        logger.info("WS disconnected (bbduk setup)")
+    except Exception as e:
+        logger.error(f"BBDuk setup error: {e}", exc_info=True)
+        try:
+            await websocket.send_json({"type": "log", "message": f"ERROR {e}", "level": "error"})
+            await websocket.send_json({"type": "status", "status": "error"})
+        except Exception:
+            pass
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
 # WebSocket: Run Pipeline
 
 @app.websocket("/ws/run-pipeline")
@@ -626,7 +862,7 @@ async def ws_run_pipeline(websocket: WebSocket):
         await ssh_exec(client, f'cp "{qc}/scripts/run_multiqc.sh" "{qc}/scripts/run_multiqc_v{vc}.sh" 2>/dev/null')
         await log(f"✓ Script archived: run_multiqc_v{vc}.sh", "multiqc", "success")
         await log("", "multiqc")
-        await log("SUCCESS All QC analyses complete!", "multiqc", "success")
+        await log("SUCCESS QC complete!", "multiqc", "success")
         await set_status("multiqc", "success")
 
     except WebSocketDisconnect:
@@ -636,6 +872,223 @@ async def ws_run_pipeline(websocket: WebSocket):
         try:
             await websocket.send_json({"type": "log", "stage": "fastqc", "message": f"ERROR {e}", "level": "error"})
             await websocket.send_json({"type": "status", "stage": "fastqc", "status": "error"})
+        except Exception:
+            pass
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
+# ─── WebSocket: Run Preprocessing (BBDuk + post-trim QC) ─────────────────────
+
+class RunPreprocessingPayload(BaseModel):
+    session_id: str
+    raw_data_path: str
+    fastqc_threads: int = 8
+    tool_method: str = "conda"
+    conda_env_name: str = ""
+    pixi_project_path: str = ""
+    conda_use_mamba: bool = False
+    bbduk_path: str = ""
+    bbmap_dir: str = ""
+    bbduk_adapter_path: str = ""
+    bbduk_ktrim: str = "r"
+    bbduk_k: int = 23
+    bbduk_mink: int = 11
+    bbduk_hdist: int = 1
+    bbduk_qtrim: str = "rl"
+    bbduk_trimq: int = 20
+    bbduk_minlen: int = 50
+    bbduk_threads: int = 8
+    trimmed_suffix: str = "_trimmed"
+    post_trim_multiqc_name: str = "post_trim_multiqc_report"
+
+
+@app.websocket("/ws/run-preprocessing")
+async def ws_run_preprocessing(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        data = await websocket.receive_json()
+        req = RunPreprocessingPayload(**data)
+        client = get_client(req.session_id)
+        activate, fqc_cmd, mqc_cmd = build_activate(req)
+
+        async def log(msg, stage="bbduk", lvl="info"):
+            await websocket.send_json({"type": "log", "stage": stage, "message": msg, "level": lvl})
+
+        async def set_status(stage, s):
+            await websocket.send_json({"type": "status", "stage": stage, "status": s})
+
+        raw = req.raw_data_path.rstrip("/")
+        parent = os.path.dirname(raw)
+        preproc = f"{parent}/analyses/2_reads_preprocessing/1_adapter_trimming_and_filtering"
+        loop = asyncio.get_event_loop()
+
+        bbduk_sh = req.bbduk_path or f"{req.bbmap_dir}/bbduk.sh"
+        adapter_ref = req.bbduk_adapter_path or f"{req.bbmap_dir}/resources/adapters.fa"
+
+        # ════════ BBDUK ════════
+        await set_status("bbduk", "running")
+
+        await log(">>> Creating directory structure...")
+        mk = f'mkdir -p "{preproc}/input" "{preproc}/output/trimmed_reads" "{preproc}/output/fastqc_reports" "{preproc}/output/multiqc_report" "{preproc}/logs" "{preproc}/scripts"'
+        await log(f"$ {mk}")
+        _, err, code = await ssh_exec(client, mk)
+        if code != 0:
+            await log(f"✗ {err.strip()}", "bbduk", "error")
+            await set_status("bbduk", "error")
+            return
+        await log("✓ Directories created", "bbduk", "success")
+        await log("")
+
+        await log(">>> Symlinking raw FASTQ to input...")
+        sym = f'for f in "{raw}"/*.fastq.gz; do [ -e "$f" ] && ln -sf "$f" "{preproc}/input/$(basename "$f")"; done'
+        await ssh_exec(client, sym)
+        ls_out, _, _ = await ssh_exec(client, f'ls -1 "{preproc}/input/"*.fastq.gz 2>/dev/null')
+        linked = [os.path.basename(f.strip()) for f in ls_out.strip().split("\n") if f.strip()]
+        for f in linked:
+            await log(f"  → {f}")
+        await log(f"✓ {len(linked)} files symlinked", "bbduk", "success")
+        await log("")
+
+        await log(">>> Recording BBDuk version...")
+        v_out, _, _ = await ssh_exec(client, f'bash "{bbduk_sh}" --version 2>&1 | head -1', timeout=30)
+        bbduk_ver = v_out.strip()
+        await log(f"  {bbduk_ver}")
+        await ssh_exec(client, f'echo "BBDuk: {bbduk_ver}" > "{preproc}/logs/software_versions.txt"')
+        await log("")
+
+        # Get R1 files
+        ls_out, _, _ = await ssh_exec(client, f'ls -1 "{preproc}/input/"*_R1*.fastq.gz 2>/dev/null || ls -1 "{preproc}/input/"*_1.fastq.gz 2>/dev/null')
+        r1_files = [os.path.basename(f.strip()) for f in ls_out.strip().split("\n") if f.strip()]
+
+        if not r1_files:
+            await log("✗ No R1 files found for paired-end processing", "bbduk", "error")
+            await set_status("bbduk", "error")
+            return
+
+        await log(f">>> Processing {len(r1_files)} paired-end samples with BBDuk...")
+
+        bbduk_params = (
+            f"ref={adapter_ref} "
+            f"ktrim={req.bbduk_ktrim} k={req.bbduk_k} mink={req.bbduk_mink} hdist={req.bbduk_hdist} "
+            f"qtrim={req.bbduk_qtrim} trimq={req.bbduk_trimq} minlen={req.bbduk_minlen} "
+            f"threads={req.bbduk_threads} tpe tbo"
+        )
+
+        # Save script
+        bbduk_script = generate_bbduk_script(req, bbduk_sh, adapter_ref, preproc, raw, bbduk_ver)
+        await ssh_exec(client, f"cat > \"{preproc}/scripts/run_bbduk.sh\" << 'METAQC_EOF'\n{bbduk_script}\nMETAQC_EOF")
+        await ssh_exec(client, f'chmod +x "{preproc}/scripts/run_bbduk.sh"')
+
+        all_bbduk_logs = []
+        suffix = req.trimmed_suffix  # e.g. "_trimmed"
+        for r1 in r1_files:
+            if "_R1_" in r1:
+                r2 = r1.replace("_R1_", "_R2_")
+                # sample_28_R1_001.fastq.gz -> sample_28_R1_trimmed.fastq.gz
+                out1 = r1.replace(".fastq.gz", f"{suffix}.fastq.gz")
+                out2 = r2.replace(".fastq.gz", f"{suffix}.fastq.gz")
+            elif "_R1." in r1:
+                r2 = r1.replace("_R1.", "_R2.")
+                out1 = r1.replace("_R1.", f"_R1{suffix}.")
+                out2 = r2.replace("_R2.", f"_R2{suffix}.")
+            elif "_1.fastq" in r1:
+                r2 = r1.replace("_1.fastq", "_2.fastq")
+                out1 = r1.replace("_1.fastq", f"_1{suffix}.fastq")
+                out2 = r2.replace("_2.fastq", f"_2{suffix}.fastq")
+            else:
+                await log(f"  ⚠ Can't determine R2 for {r1}, skipping")
+                continue
+
+            sample = r1.split("_R1")[0].split("_1.fastq")[0]
+
+            await log(f"  >>> Processing: {sample}")
+            cmd = (
+                f'bash "{bbduk_sh}" '
+                f'in1="{preproc}/input/{r1}" in2="{preproc}/input/{r2}" '
+                f'out1="{preproc}/output/trimmed_reads/{out1}" out2="{preproc}/output/trimmed_reads/{out2}" '
+                f'{bbduk_params} 2>&1'
+            )
+            await log(f"  $ bbduk.sh in1={r1} in2={r2} out1={out1} out2={out2} {bbduk_params}")
+
+            ch = await loop.run_in_executor(None, client.get_transport().open_session)
+            ch.settimeout(1800)
+            await loop.run_in_executor(None, ch.exec_command, cmd)
+            exit_code, lines = await stream_channel_async(ch, websocket, "bbduk")
+            await loop.run_in_executor(None, ch.close)
+            all_bbduk_logs.extend(lines)
+
+            if exit_code != 0:
+                await log(f"  ✗ BBDuk failed for {sample} (exit {exit_code})", "bbduk", "error")
+                await set_status("bbduk", "error")
+                return
+            await log(f"  ✓ {sample} trimmed", "bbduk", "success")
+            await log("")
+
+        await ssh_exec(client, f"cat > \"{preproc}/logs/bbduk.log\" << 'METAQC_EOF'\n" + "\n".join(all_bbduk_logs) + "\nMETAQC_EOF")
+        ver_clean = bbduk_ver.split()[-1] if bbduk_ver else "unknown"
+        await ssh_exec(client, f'cp "{preproc}/scripts/run_bbduk.sh" "{preproc}/scripts/run_bbduk_v{ver_clean}.sh" 2>/dev/null')
+        await log("")
+        await log(f"✓ All {len(r1_files)} samples trimmed", "bbduk", "success")
+        await log(f"✓ Script archived: run_bbduk_v{ver_clean}.sh", "bbduk", "success")
+        await set_status("bbduk", "success")
+
+        # ════════ POST-TRIM FASTQC ════════
+        await asyncio.sleep(0.5)
+        await set_status("post_fastqc", "running")
+
+        await log(f">>> Running FastQC on trimmed reads ({req.fastqc_threads} threads)...", "post_fastqc")
+        run = wrap_cmd(activate, f'{fqc_cmd} --threads {req.fastqc_threads} --outdir "{preproc}/output/fastqc_reports" "{preproc}/output/trimmed_reads"/*.fastq.gz 2>&1')
+        await log(f"$ {fqc_cmd} --threads {req.fastqc_threads} --outdir .../output/fastqc_reports/ .../output/trimmed_reads/*.fastq.gz", "post_fastqc")
+
+        ch = await loop.run_in_executor(None, client.get_transport().open_session)
+        await loop.run_in_executor(None, ch.exec_command, run)
+        exit_code, log_lines = await stream_channel_async(ch, websocket, "post_fastqc")
+        await loop.run_in_executor(None, ch.close)
+
+        await ssh_exec(client, f"cat > \"{preproc}/logs/post_trim_fastqc.log\" << 'METAQC_EOF'\n" + "\n".join(log_lines) + "\nMETAQC_EOF")
+        if exit_code != 0:
+            await log(f"✗ Post-trim FastQC failed (exit {exit_code})", "post_fastqc", "error")
+            await set_status("post_fastqc", "error")
+            return
+        await log("✓ Post-trim FastQC complete", "post_fastqc", "success")
+        await set_status("post_fastqc", "success")
+
+        # ════════ POST-TRIM MULTIQC ════════
+        await asyncio.sleep(0.3)
+        await set_status("post_multiqc", "running")
+
+        ptmqc_name = req.post_trim_multiqc_name
+        await log(">>> Running MultiQC on post-trim FastQC reports...", "post_multiqc")
+        run = wrap_cmd(activate, f'{mqc_cmd} "{preproc}/output/fastqc_reports" --outdir "{preproc}/output/multiqc_report" --filename "{ptmqc_name}" --force 2>&1')
+        await log(f"$ {mqc_cmd} .../output/fastqc_reports/ --outdir .../output/multiqc_report/ --filename {ptmqc_name} --force", "post_multiqc")
+
+        ch = await loop.run_in_executor(None, client.get_transport().open_session)
+        await loop.run_in_executor(None, ch.exec_command, run)
+        exit_code, log_lines = await stream_channel_async(ch, websocket, "post_multiqc")
+        await loop.run_in_executor(None, ch.close)
+
+        await ssh_exec(client, f"cat > \"{preproc}/logs/post_trim_multiqc.log\" << 'METAQC_EOF'\n" + "\n".join(log_lines) + "\nMETAQC_EOF")
+        if exit_code != 0:
+            await log(f"✗ Post-trim MultiQC failed (exit {exit_code})", "post_multiqc", "error")
+            await set_status("post_multiqc", "error")
+            return
+        await log("✓ Post-trim MultiQC complete", "post_multiqc", "success")
+        await log(f"✓ Report: {preproc}/output/multiqc_report/{ptmqc_name}.html", "post_multiqc", "success")
+        await log("")
+        await log("SUCCESS Preprocessing complete! BBDuk → FastQC → MultiQC", "post_multiqc", "success")
+        await set_status("post_multiqc", "success")
+
+    except WebSocketDisconnect:
+        logger.info("WS disconnected (preprocessing)")
+    except Exception as e:
+        logger.error(f"Preprocessing error: {e}", exc_info=True)
+        try:
+            await websocket.send_json({"type": "log", "stage": "bbduk", "message": f"ERROR {e}", "level": "error"})
+            await websocket.send_json({"type": "status", "stage": "bbduk", "status": "error"})
         except Exception:
             pass
     finally:
@@ -674,4 +1127,62 @@ set -euo pipefail
 QC="{qc}"
 
 {mqc_cmd} "$QC/output/fastqc_reports" --outdir "$QC/output/multiqc_report" --filename "{req.multiqc_name}" --force 2>&1 | tee "$QC/logs/multiqc.log"
+"""
+
+
+def generate_bbduk_script(req, bbduk_sh, adapter_ref, preproc, raw, version):
+    suffix = req.trimmed_suffix
+    return f"""#!/usr/bin/env bash
+# BBDuk Read Preprocessing Script - Generated by MetaQC Pipeline
+# Version: {version}
+# Suffix: {suffix}
+# Parameters: ktrim={req.bbduk_ktrim} k={req.bbduk_k} mink={req.bbduk_mink} hdist={req.bbduk_hdist} qtrim={req.bbduk_qtrim} trimq={req.bbduk_trimq} minlen={req.bbduk_minlen} threads={req.bbduk_threads}
+set -euo pipefail
+
+BBDUK="{bbduk_sh}"
+REF="{adapter_ref}"
+RAW="{raw}"
+PREPROC="{preproc}"
+SUFFIX="{suffix}"
+
+mkdir -p "$PREPROC"/{{input,output/trimmed_reads,output/fastqc_reports,output/multiqc_report,logs,scripts}}
+
+# Symlink raw data
+for f in "$RAW"/*.fastq.gz; do
+  [ -e "$f" ] && ln -sf "$f" "$PREPROC/input/$(basename "$f")"
+done
+
+# Process each R1/R2 pair
+for R1 in "$PREPROC/input/"*_R1*.fastq.gz "$PREPROC/input/"*_1.fastq.gz; do
+  [ -e "$R1" ] || continue
+  BASENAME=$(basename "$R1")
+
+  if [[ "$BASENAME" == *"_R1_"* ]]; then
+    R2=$(echo "$R1" | sed 's/_R1_/_R2_/')
+    OUT1=$(echo "$BASENAME" | sed "s/.fastq.gz/${{SUFFIX}}.fastq.gz/")
+    OUT2=$(echo "$OUT1" | sed 's/_R1_/_R2_/')
+  elif [[ "$BASENAME" == *"_R1."* ]]; then
+    R2=$(echo "$R1" | sed 's/_R1\\./_R2./')
+    OUT1=$(echo "$BASENAME" | sed "s/_R1\\./_R1${{SUFFIX}}./")
+    OUT2=$(echo "$OUT1" | sed "s/_R1${{SUFFIX}}/_R2${{SUFFIX}}/")
+  elif [[ "$BASENAME" == *"_1.fastq"* ]]; then
+    R2=$(echo "$R1" | sed 's/_1\\.fastq/_2.fastq/')
+    OUT1=$(echo "$BASENAME" | sed "s/_1\\.fastq/_1${{SUFFIX}}.fastq/")
+    OUT2=$(echo "$OUT1" | sed "s/_1${{SUFFIX}}/_2${{SUFFIX}}/")
+  else
+    continue
+  fi
+
+  echo "Processing: $BASENAME -> $OUT1, $OUT2"
+  bash "$BBDUK" \\
+    in1="$R1" in2="$R2" \\
+    out1="$PREPROC/output/trimmed_reads/$OUT1" out2="$PREPROC/output/trimmed_reads/$OUT2" \\
+    ref="$REF" \\
+    ktrim={req.bbduk_ktrim} k={req.bbduk_k} mink={req.bbduk_mink} hdist={req.bbduk_hdist} \\
+    qtrim={req.bbduk_qtrim} trimq={req.bbduk_trimq} minlen={req.bbduk_minlen} \\
+    threads={req.bbduk_threads} tpe tbo \\
+    2>&1 | tee -a "$PREPROC/logs/bbduk.log"
+done
+
+echo "BBDuk preprocessing complete"
 """

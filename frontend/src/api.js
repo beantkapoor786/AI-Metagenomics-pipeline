@@ -47,6 +47,34 @@ export async function scanDirectory(sessionId, path) {
   return post("/api/scan-directory", { session_id: sessionId, path });
 }
 
+export async function downloadReports({ sessionId, rawDataPath, multiqcName, includePostTrim, postTrimMultiqcName }) {
+  const res = await fetch(`${BASE}/api/download-reports`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      session_id: sessionId,
+      raw_data_path: rawDataPath,
+      multiqc_name: multiqcName,
+      include_post_trim: includePostTrim,
+      post_trim_multiqc_name: postTrimMultiqcName,
+    }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  // Trigger browser download
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "multiqc_reports.zip";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 // ─── WebSocket helpers ──────────────────────────────────────────────────────
 
 /**
@@ -105,4 +133,12 @@ export function wsInstallTools(payload, onMessage, onClose) {
 
 export function wsRunPipeline(payload, onMessage, onClose) {
   return openWS("/ws/run-pipeline", payload, onMessage, onClose);
+}
+
+export function wsSetupBBDuk(payload, onMessage, onClose) {
+  return openWS("/ws/setup-bbduk", payload, onMessage, onClose);
+}
+
+export function wsRunPreprocessing(payload, onMessage, onClose) {
+  return openWS("/ws/run-preprocessing", payload, onMessage, onClose);
 }
