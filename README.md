@@ -125,8 +125,10 @@ project/
 
  # Tasks
 
+- [ ] in Pixi, when I have selected "use existing" just show the path to package. Replace install & verify with Verify.
 - [ ] what about 2FA?
 - [x] Fix "Backend Connection" on by defualt on GUI
-- [ ] add bbduk adapter trimming and quality filtering step
+- [x] add bbduk adapter trimming and quality filtering step
 - [ ] add bbduk contaminant DNA removal step
 - [ ] add bbduk error correction step
+- [ ] once quality check is complete, add LLM agent
