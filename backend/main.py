@@ -1,7 +1,7 @@
 """
 MetaQC Pipeline — FastAPI Backend
 SSH via paramiko, real-time logs via WebSocket.
-All blocking SSH calls run in thread pool to avoid blocking async loop.
+SQLite for field autocomplete history.
 """
 
 import asyncio
@@ -10,10 +10,11 @@ import io
 import json
 import logging
 import os
+import sqlite3
 import uuid
 import zipfile
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, List
 
 import paramiko
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
@@ -26,9 +27,72 @@ logger = logging.getLogger("metaqc")
 
 sessions: dict = {}
 
+# ─── SQLite for field autocomplete ───────────────────────────────────────────
+DB_PATH = os.environ.get("METAQC_DB", "/data/metaqc_history.db")
+
+
+def init_db():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS field_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            field_name TEXT NOT NULL,
+            field_value TEXT NOT NULL,
+            used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(field_name, field_value)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_field_name ON field_history(field_name)")
+    conn.commit()
+    conn.close()
+    logger.info(f"SQLite DB initialized at {DB_PATH}")
+
+
+def db_save_field(field_name: str, value: str):
+    if not value or not value.strip():
+        return
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT OR REPLACE INTO field_history (field_name, field_value, used_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+        (field_name, value.strip())
+    )
+    conn.commit()
+    conn.close()
+
+
+def db_get_suggestions(field_name: str, prefix: str = "") -> list:
+    conn = sqlite3.connect(DB_PATH)
+    if prefix:
+        rows = conn.execute(
+            "SELECT field_value FROM field_history WHERE field_name = ? AND field_value LIKE ? ORDER BY used_at DESC LIMIT 10",
+            (field_name, f"{prefix}%")
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT field_value FROM field_history WHERE field_name = ? ORDER BY used_at DESC LIMIT 10",
+            (field_name,)
+        ).fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+
+def db_save_many(fields: dict):
+    """Save multiple field values at once. fields = {field_name: value}"""
+    conn = sqlite3.connect(DB_PATH)
+    for name, value in fields.items():
+        if value and str(value).strip():
+            conn.execute(
+                "INSERT OR REPLACE INTO field_history (field_name, field_value, used_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                (name, str(value).strip())
+            )
+    conn.commit()
+    conn.close()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    init_db()
     yield
     for sid, s in sessions.items():
         try:
@@ -202,6 +266,43 @@ async def health():
     return {"status": "ok", "sessions": len(sessions)}
 
 
+# ─── Autocomplete endpoints ──────────────────────────────────────────────────
+
+class SaveFieldsRequest(BaseModel):
+    fields: dict  # {field_name: value}
+
+
+@app.get("/api/autocomplete/{field_name}")
+async def get_autocomplete(field_name: str, prefix: str = ""):
+    """Get autocomplete suggestions for a field."""
+    suggestions = db_get_suggestions(field_name, prefix)
+    return {"field": field_name, "suggestions": suggestions}
+
+
+@app.post("/api/autocomplete/save")
+async def save_autocomplete(req: SaveFieldsRequest):
+    """Save multiple field values for future autocomplete."""
+    db_save_many(req.fields)
+    return {"saved": len(req.fields)}
+
+
+@app.get("/api/autocomplete/all")
+async def get_all_autocomplete():
+    """Get all saved field values grouped by field name."""
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT field_name, field_value FROM field_history ORDER BY field_name, used_at DESC"
+    ).fetchall()
+    conn.close()
+    result = {}
+    for name, value in rows:
+        if name not in result:
+            result[name] = []
+        if len(result[name]) < 10:
+            result[name].append(value)
+    return result
+
+
 @app.post("/api/ssh/connect")
 async def ssh_connect_endpoint(req: SSHConnectRequest):
     client = paramiko.SSHClient()
@@ -246,6 +347,15 @@ async def ssh_connect_endpoint(req: SSHConnectRequest):
 
         uname, _, _ = await ssh_exec(client, "uname -n")
         logger.info(f"Connected: {req.username}@{req.hostname}:{req.port} [{sid}]")
+
+        # Auto-save SSH fields for autocomplete
+        db_save_many({
+            "ssh_hostname": req.hostname,
+            "ssh_port": str(req.port),
+            "ssh_username": req.username,
+            **({"ssh_key_path": req.key_path} if req.key_path else {}),
+        })
+
         return {
             "session_id": sid, "success": True,
             "message": f"Connected to {uname.strip() or req.hostname}",
@@ -322,6 +432,8 @@ class DownloadReportsRequest(BaseModel):
     multiqc_name: str = "multiqc_report"
     include_post_trim: bool = False
     post_trim_multiqc_name: str = "post_trim_multiqc_report"
+    include_decontam: bool = False
+    decontam_multiqc_name: str = "decontam_multiqc_report"
 
 
 @app.post("/api/download-reports")
@@ -332,17 +444,17 @@ async def download_reports(req: DownloadReportsRequest):
     raw = req.raw_data_path.rstrip("/")
     parent = os.path.dirname(raw)
 
-    # Collect report paths to download
     reports = []
-
-    # 1_QC MultiQC report
     qc_report = f"{parent}/analyses/1_QC/output/multiqc_report/{req.multiqc_name}.html"
     reports.append(("1_QC_multiqc", qc_report))
 
-    # Post-trim MultiQC report (if preprocessing was run)
     if req.include_post_trim:
         pt_report = f"{parent}/analyses/2_reads_preprocessing/1_adapter_trimming_and_filtering/output/multiqc_report/{req.post_trim_multiqc_name}.html"
         reports.append(("post_trim_multiqc", pt_report))
+
+    if req.include_decontam:
+        dc_report = f"{parent}/analyses/2_reads_preprocessing/2_decontamination/output/multiqc_report/{req.decontam_multiqc_name}.html"
+        reports.append(("post_decontam_multiqc", dc_report))
 
     # Open SFTP and read files
     loop = asyncio.get_event_loop()
@@ -391,6 +503,14 @@ async def ws_install_tools(websocket: WebSocket):
         data = await websocket.receive_json()
         req = InstallToolsPayload(**data)
         client = get_client(req.session_id)
+
+        # Auto-save tool config
+        fields = {"tool_method": req.method}
+        if req.method == "conda":
+            fields["conda_env_name"] = req.conda_env_name
+        elif req.method == "pixi":
+            fields["pixi_project_path"] = req.pixi_project_path
+        db_save_many(fields)
 
         async def log(msg, lvl="info"):
             await websocket.send_json({"type": "log", "message": msg, "level": lvl})
@@ -648,6 +768,7 @@ async def ws_setup_bbduk(websocket: WebSocket):
 
             await log("")
             await log("SUCCESS BBDuk verified!", "success")
+            db_save_many({"bbduk_path": bbduk, "bbmap_dir": bbmap_dir})
             await set_status("success", bbmap_dir=bbmap_dir, bbduk_path=bbduk, adapters_path=adapters)
 
         else:
@@ -724,6 +845,7 @@ async def ws_setup_bbduk(websocket: WebSocket):
 
             await log("")
             await log("SUCCESS BBMap/BBDuk installed!", "success")
+            db_save_many({"bbduk_path": bbduk_path, "bbmap_dir": bbmap_dir, "bbduk_install_path": install_dir})
             await set_status("success", bbmap_dir=bbmap_dir, bbduk_path=bbduk_path, adapters_path=adapters)
 
     except WebSocketDisconnect:
@@ -763,6 +885,12 @@ async def ws_run_pipeline(websocket: WebSocket):
         parent = os.path.dirname(raw)
         qc = f"{parent}/analyses/1_QC"
         loop = asyncio.get_event_loop()
+
+        # Auto-save pipeline fields for autocomplete
+        db_save_many({
+            "raw_data_path": req.raw_data_path,
+            "multiqc_name": req.multiqc_name,
+        })
 
         # FASTQC
         await set_status("fastqc", "running")
@@ -928,6 +1056,12 @@ async def ws_run_preprocessing(websocket: WebSocket):
 
         bbduk_sh = req.bbduk_path or f"{req.bbmap_dir}/bbduk.sh"
         adapter_ref = req.bbduk_adapter_path or f"{req.bbmap_dir}/resources/adapters.fa"
+
+        # Auto-save preprocessing fields
+        db_save_many({
+            "trimmed_suffix": req.trimmed_suffix,
+            "post_trim_multiqc_name": req.post_trim_multiqc_name,
+        })
 
         # ════════ BBDUK ════════
         await set_status("bbduk", "running")
@@ -1186,3 +1320,312 @@ done
 
 echo "BBDuk preprocessing complete"
 """
+
+
+# ─── Decontamination (BBSplit) ────────────────────────────────────────────────
+
+class RunDecontamPayload(BaseModel):
+    session_id: str
+    raw_data_path: str
+    fastqc_threads: int = 8
+    tool_method: str = "conda"
+    conda_env_name: str = ""
+    pixi_project_path: str = ""
+    conda_use_mamba: bool = False
+    bbmap_dir: str = ""
+    genomes: list = []          # [{"name":"human","path":"resources/...","enabled":true}]
+    custom_genomes: list = []   # [{"name":"custom1","path":"/abs/path"}]
+    minid: int = 93
+    bbsplit_threads: int = 4
+    keep_contaminant_reads: bool = False
+    decontam_suffix: str = "_decontam"
+    decontam_multiqc_name: str = "decontam_multiqc_report"
+    trimmed_suffix: str = "_trimmed"
+
+
+@app.websocket("/ws/run-decontamination")
+async def ws_run_decontamination(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        data = await websocket.receive_json()
+        req = RunDecontamPayload(**data)
+        client = get_client(req.session_id)
+        activate, fqc_cmd, mqc_cmd = build_activate(req)
+
+        async def log(msg, stage="bbsplit", lvl="info"):
+            await websocket.send_json({"type": "log", "stage": stage, "message": msg, "level": lvl})
+
+        async def set_status(stage, s):
+            await websocket.send_json({"type": "status", "stage": stage, "status": s})
+
+        raw = req.raw_data_path.rstrip("/")
+        parent = os.path.dirname(raw)
+        bbmap_dir = req.bbmap_dir.rstrip("/")
+        bbsplit_sh = f"{bbmap_dir}/bbsplit.sh"
+        trimming_output = f"{parent}/analyses/2_reads_preprocessing/1_adapter_trimming_and_filtering/output/trimmed_reads"
+        decontam_dir = f"{parent}/analyses/2_reads_preprocessing/2_decontamination"
+        loop = asyncio.get_event_loop()
+
+        db_save_many({"decontam_suffix": req.decontam_suffix, "decontam_multiqc_name": req.decontam_multiqc_name})
+
+        # ════════ BBSPLIT ════════
+        await set_status("bbsplit", "running")
+
+        await log(">>> Creating directory structure...")
+        dirs = f'"{decontam_dir}/input" "{decontam_dir}/output/clean_reads" "{decontam_dir}/output/fastqc_reports" "{decontam_dir}/output/multiqc_report" "{decontam_dir}/logs" "{decontam_dir}/scripts"'
+        if req.keep_contaminant_reads:
+            dirs += f' "{decontam_dir}/output/contaminant_reads"'
+        mk = f"mkdir -p {dirs}"
+        await log(f"$ {mk}")
+        _, err, code = await ssh_exec(client, mk)
+        if code != 0:
+            await log(f"✗ {err.strip()}", "bbsplit", "error")
+            await set_status("bbsplit", "error"); return
+        await log("✓ Directories created", "bbsplit", "success")
+        await log("")
+
+        await log(">>> Symlinking trimmed reads...")
+        sym = f'for f in "{trimming_output}"/*.fastq.gz; do [ -e "$f" ] && ln -sf "$f" "{decontam_dir}/input/$(basename "$f")"; done'
+        await ssh_exec(client, sym)
+        ls_out, _, _ = await ssh_exec(client, f'ls -1 "{decontam_dir}/input/"*.fastq.gz 2>/dev/null')
+        linked = [os.path.basename(f.strip()) for f in ls_out.strip().split("\n") if f.strip()]
+        for f in linked:
+            await log(f"  → {f}")
+        await log(f"✓ {len(linked)} files symlinked", "bbsplit", "success")
+        await log("")
+
+        await log(">>> Verifying bbsplit.sh...")
+        out, _, code = await ssh_exec(client, f'test -f "{bbsplit_sh}" && echo "FOUND" || echo "MISSING"')
+        if "MISSING" in out:
+            await log("✗ bbsplit.sh not found", "bbsplit", "error")
+            await set_status("bbsplit", "error"); return
+        await log("✓ bbsplit.sh found", "bbsplit", "success")
+        await log("")
+
+        enabled_genomes = [g for g in req.genomes if g.get("enabled", True)]
+        all_genomes = enabled_genomes + req.custom_genomes
+        if not all_genomes:
+            await log("✗ No contaminant genomes selected", "bbsplit", "error")
+            await set_status("bbsplit", "error"); return
+
+        await log(f">>> Verifying {len(all_genomes)} genome references...")
+        ref_parts = []
+        for g in all_genomes:
+            gpath = g["path"]
+            if not gpath.startswith("/"):
+                gpath = f"{bbmap_dir}/{gpath}"
+            out, _, _ = await ssh_exec(client, f'test -f "{gpath}" && echo "FOUND" || echo "MISSING"')
+            if "MISSING" in out:
+                await log(f"  ✗ {g['name']}: NOT FOUND at {gpath}", "bbsplit", "error")
+                await set_status("bbsplit", "error"); return
+            await log(f"  ✓ {g['name']}: {gpath}")
+            ref_parts.append(f"ref_{g['name']}={gpath}")
+        ref_string = " ".join(ref_parts)
+        await log("")
+
+        await log(">>> Recording BBSplit version...")
+        v_out, _, _ = await ssh_exec(client, f'bash "{bbsplit_sh}" --version 2>&1 | head -1', timeout=30)
+        bbsplit_ver = v_out.strip()
+        await log(f"  {bbsplit_ver}")
+        await ssh_exec(client, f'echo "BBSplit: {bbsplit_ver}" > "{decontam_dir}/logs/software_versions.txt"')
+        await log("")
+
+        ls_out, _, _ = await ssh_exec(client, f'ls -1 "{decontam_dir}/input/"*_R1*.fastq.gz 2>/dev/null || ls -1 "{decontam_dir}/input/"*_1*.fastq.gz 2>/dev/null')
+        r1_files = [os.path.basename(f.strip()) for f in ls_out.strip().split("\n") if f.strip()]
+        if not r1_files:
+            await log("✗ No R1 files found", "bbsplit", "error")
+            await set_status("bbsplit", "error"); return
+
+        await log(f">>> Decontaminating {len(r1_files)} samples...")
+        await log(f"  Genomes: {', '.join(g['name'] for g in all_genomes)}")
+        await log(f"  minid={req.minid}, threads={req.bbsplit_threads}, pairedonly=t")
+        await log("")
+
+        decontam_script = generate_bbsplit_script(req, bbsplit_sh, ref_string, all_genomes, decontam_dir, trimming_output, bbsplit_ver)
+        await ssh_exec(client, f"cat > \"{decontam_dir}/scripts/run_bbsplit.sh\" << 'METAQC_EOF'\n{decontam_script}\nMETAQC_EOF")
+        await ssh_exec(client, f'chmod +x "{decontam_dir}/scripts/run_bbsplit.sh"')
+
+        dsuffix = req.decontam_suffix
+        tsuffix = req.trimmed_suffix
+        all_logs = []
+        for r1 in r1_files:
+            if "_R1_" in r1:
+                r2 = r1.replace("_R1_", "_R2_")
+            elif "_R1." in r1:
+                r2 = r1.replace("_R1.", "_R2.")
+            elif f"_1{tsuffix}" in r1:
+                r2 = r1.replace(f"_1{tsuffix}", f"_2{tsuffix}")
+            else:
+                await log(f"  ⚠ Can\'t determine R2 for {r1}, skipping")
+                continue
+
+            base = r1.replace(".fastq.gz", "")
+            out1 = f"{base}{dsuffix}_R1.fastq.gz"
+            out2 = out1.replace(f"{dsuffix}_R1", f"{dsuffix}_R2")
+            sample = r1.split("_R1")[0].split(f"_1{tsuffix}")[0]
+
+            await log(f"  >>> Processing: {sample}")
+
+            cmd_parts = [
+                f'bash "{bbsplit_sh}"',
+                f'in1="{decontam_dir}/input/{r1}" in2="{decontam_dir}/input/{r2}"',
+                f'basename="{decontam_dir}/output/contaminant_reads/{sample}_%.fastq.gz"' if req.keep_contaminant_reads else "",
+                f'outu1="{decontam_dir}/output/clean_reads/{out1}" outu2="{decontam_dir}/output/clean_reads/{out2}"',
+                ref_string,
+                f"minid={req.minid / 100:.2f}",
+                f"threads={req.bbsplit_threads}",
+                "pairedonly=t",
+                "2>&1",
+            ]
+            cmd = " ".join(p for p in cmd_parts if p)
+            await log(f"  $ bbsplit.sh in1={r1} in2={r2} outu1={out1} outu2={out2} ... minid=0.{req.minid}")
+
+            ch = await loop.run_in_executor(None, client.get_transport().open_session)
+            ch.settimeout(3600)
+            await loop.run_in_executor(None, ch.exec_command, cmd)
+            exit_code, lines = await stream_channel_async(ch, websocket, "bbsplit")
+            await loop.run_in_executor(None, ch.close)
+            all_logs.extend(lines)
+
+            if exit_code != 0:
+                await log(f"  ✗ BBSplit failed for {sample} (exit {exit_code})", "bbsplit", "error")
+                await set_status("bbsplit", "error"); return
+            await log(f"  ✓ {sample} decontaminated", "bbsplit", "success")
+            await log("")
+
+        log_text = "\n".join(all_logs)
+        await ssh_exec(client, f"cat > \"{decontam_dir}/logs/bbsplit.log\" << 'METAQC_EOF'\n{log_text}\nMETAQC_EOF")
+        ver_clean = bbsplit_ver.split()[-1] if bbsplit_ver else "unknown"
+        await ssh_exec(client, f'cp "{decontam_dir}/scripts/run_bbsplit.sh" "{decontam_dir}/scripts/run_bbsplit_v{ver_clean}.sh" 2>/dev/null')
+        await log(f"✓ All {len(r1_files)} samples decontaminated", "bbsplit", "success")
+        if req.keep_contaminant_reads:
+            await log(f"✓ Contaminant reads saved", "bbsplit")
+        await log(f"✓ Script archived: run_bbsplit_v{ver_clean}.sh", "bbsplit", "success")
+        await set_status("bbsplit", "success")
+
+        # ════════ POST-DECONTAM FASTQC ════════
+        await asyncio.sleep(0.5)
+        await set_status("decontam_fastqc", "running")
+
+        await log(f">>> Running FastQC on decontaminated reads ({req.fastqc_threads} threads)...", "decontam_fastqc")
+        run = wrap_cmd(activate, f'{fqc_cmd} --threads {req.fastqc_threads} --outdir "{decontam_dir}/output/fastqc_reports" "{decontam_dir}/output/clean_reads"/*.fastq.gz 2>&1')
+        await log(f"$ {fqc_cmd} --threads {req.fastqc_threads} --outdir .../fastqc_reports/ .../clean_reads/*.fastq.gz", "decontam_fastqc")
+
+        ch = await loop.run_in_executor(None, client.get_transport().open_session)
+        await loop.run_in_executor(None, ch.exec_command, run)
+        exit_code, log_lines = await stream_channel_async(ch, websocket, "decontam_fastqc")
+        await loop.run_in_executor(None, ch.close)
+
+        fqc_log = "\n".join(log_lines)
+        await ssh_exec(client, f"cat > \"{decontam_dir}/logs/post_decontam_fastqc.log\" << 'METAQC_EOF'\n{fqc_log}\nMETAQC_EOF")
+        if exit_code != 0:
+            await log(f"✗ FastQC failed (exit {exit_code})", "decontam_fastqc", "error")
+            await set_status("decontam_fastqc", "error"); return
+        await log("✓ Post-decontam FastQC complete", "decontam_fastqc", "success")
+        await set_status("decontam_fastqc", "success")
+
+        # ════════ POST-DECONTAM MULTIQC ════════
+        await asyncio.sleep(0.3)
+        await set_status("decontam_multiqc", "running")
+
+        dmqc_name = req.decontam_multiqc_name
+        await log(">>> Running MultiQC on post-decontam reports...", "decontam_multiqc")
+        run = wrap_cmd(activate, f'{mqc_cmd} "{decontam_dir}/output/fastqc_reports" --outdir "{decontam_dir}/output/multiqc_report" --filename "{dmqc_name}" --force 2>&1')
+        await log(f"$ {mqc_cmd} ... --filename {dmqc_name} --force", "decontam_multiqc")
+
+        ch = await loop.run_in_executor(None, client.get_transport().open_session)
+        await loop.run_in_executor(None, ch.exec_command, run)
+        exit_code, log_lines = await stream_channel_async(ch, websocket, "decontam_multiqc")
+        await loop.run_in_executor(None, ch.close)
+
+        mqc_log = "\n".join(log_lines)
+        await ssh_exec(client, f"cat > \"{decontam_dir}/logs/post_decontam_multiqc.log\" << 'METAQC_EOF'\n{mqc_log}\nMETAQC_EOF")
+        if exit_code != 0:
+            await log(f"✗ MultiQC failed (exit {exit_code})", "decontam_multiqc", "error")
+            await set_status("decontam_multiqc", "error"); return
+        await log("✓ Post-decontam MultiQC complete", "decontam_multiqc", "success")
+        await log(f"✓ Report: {decontam_dir}/output/multiqc_report/{dmqc_name}.html", "decontam_multiqc", "success")
+        await log("")
+        await log("SUCCESS Decontamination complete!", "decontam_multiqc", "success")
+        await set_status("decontam_multiqc", "success")
+
+    except WebSocketDisconnect:
+        logger.info("WS disconnected (decontamination)")
+    except Exception as e:
+        logger.error(f"Decontamination error: {e}", exc_info=True)
+        try:
+            await websocket.send_json({"type": "log", "stage": "bbsplit", "message": f"ERROR {e}", "level": "error"})
+            await websocket.send_json({"type": "status", "stage": "bbsplit", "status": "error"})
+        except Exception:
+            pass
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
+def generate_bbsplit_script(req, bbsplit_sh, ref_string, genomes, decontam_dir, trimming_output, version):
+    dsuffix = req.decontam_suffix
+    keep_contam = "true" if req.keep_contaminant_reads else "false"
+    genome_list = ", ".join(g["name"] for g in genomes)
+    script = f"""#!/usr/bin/env bash
+# BBSplit Contaminant Removal Script - Generated by MetaQC Pipeline
+# Version: {version}
+# Genomes: {genome_list}
+# Parameters: minid={req.minid}, threads={req.bbsplit_threads}, pairedonly=t
+set -euo pipefail
+
+BBSPLIT="{bbsplit_sh}"
+TRIMMED="{trimming_output}"
+DECONTAM="{decontam_dir}"
+KEEP_CONTAM={keep_contam}
+DSUFFIX="{dsuffix}"
+"""
+    script += """
+mkdir -p "$DECONTAM"/{input,output/clean_reads,output/fastqc_reports,output/multiqc_report,logs,scripts}
+[ "$KEEP_CONTAM" = "true" ] && mkdir -p "$DECONTAM/output/contaminant_reads"
+
+for f in "$TRIMMED"/*.fastq.gz; do
+  [ -e "$f" ] && ln -sf "$f" "$DECONTAM/input/$(basename "$f")"
+done
+
+for R1 in "$DECONTAM/input/"*_R1*.fastq.gz "$DECONTAM/input/"*_1*.fastq.gz; do
+  [ -e "$R1" ] || continue
+  BASENAME=$(basename "$R1")
+
+  if [[ "$BASENAME" == *"_R1_"* ]]; then
+    R2=$(echo "$R1" | sed 's/_R1_/_R2_/')
+    BASE=$(echo "$BASENAME" | sed 's/.fastq.gz//')
+    OUT1="${BASE}${DSUFFIX}_R1.fastq.gz"
+    OUT2=$(echo "$OUT1" | sed "s/${DSUFFIX}_R1/${DSUFFIX}_R2/")
+  elif [[ "$BASENAME" == *"_R1."* ]]; then
+    R2=$(echo "$R1" | sed 's/_R1\\./_R2./')
+    BASE=$(echo "$BASENAME" | sed 's/.fastq.gz//')
+    OUT1="${BASE}${DSUFFIX}_R1.fastq.gz"
+    OUT2=$(echo "$OUT1" | sed "s/${DSUFFIX}_R1/${DSUFFIX}_R2/")
+  else
+    continue
+  fi
+
+  SAMPLE=$(echo "$BASENAME" | sed 's/_R1.*//')
+  echo "Processing: $BASENAME -> $OUT1, $OUT2"
+
+  CONTAM_ARG=""
+  [ "$KEEP_CONTAM" = "true" ] && CONTAM_ARG="basename=$DECONTAM/output/contaminant_reads/${SAMPLE}_%.fastq.gz"
+
+  bash "$BBSPLIT" \\
+    in1="$R1" in2="$R2" \\
+    outu1="$DECONTAM/output/clean_reads/$OUT1" outu2="$DECONTAM/output/clean_reads/$OUT2" \\
+    $CONTAM_ARG \\
+"""
+    script += f"    {ref_string} \\\\\n"
+    script += f"    minid={req.minid / 100:.2f} \\\\\n"
+    script += f"    threads={req.bbsplit_threads} \\\\\n"
+    script += """    pairedonly=t \\
+    2>&1 | tee -a "$DECONTAM/logs/bbsplit.log"
+done
+
+echo "BBSplit decontamination complete"
+"""
+    return script

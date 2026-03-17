@@ -7,8 +7,10 @@ services:
       - "8000:8000"
     environment:
       - PYTHONUNBUFFERED=1
+      - METAQC_DB=/data/metaqc_history.db
     volumes:
       - ~/.ssh:/home/appuser/.ssh:ro
+      - metaqc-data:/data
 
   frontend:
     build: ./frontend
@@ -18,3 +20,7 @@ services:
       - "3000:3000"
     depends_on:
       - backend
+
+volumes:
+  metaqc-data:
+    driver: local

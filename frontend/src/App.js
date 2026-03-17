@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
-import { sshConnect, scanDirectory, downloadReports, wsInstallTools, wsRunPipeline, wsSetupBBDuk, wsRunPreprocessing, healthCheck } from "./api";
+import { sshConnect, scanDirectory, downloadReports, wsInstallTools, wsRunPipeline, wsSetupBBDuk, wsRunPreprocessing, wsRunDecontamination, healthCheck, loadAllSuggestions, saveSuggestions } from "./api";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 const STEPS = [
@@ -56,19 +56,75 @@ function StepIndicator({ steps, currentStep }) {
   );
 }
 
-function Input({ label, value, onChange, type="text", placeholder, hint, required, disabled, isMono, style }) {
+function Input({ label, value, onChange, type="text", placeholder, hint, required, disabled, isMono, style, suggestions=[], fieldName }) {
+  const [showSuggestions, setShowSuggestions] = useState(false);
+  const [filtered, setFiltered] = useState([]);
+  const wrapRef = useRef(null);
+
+  // Filter suggestions based on current value
+  useEffect(() => {
+    if (!suggestions || suggestions.length === 0) { setFiltered([]); return; }
+    if (!value) { setFiltered(suggestions.slice(0, 8)); return; }
+    const lower = value.toLowerCase();
+    setFiltered(suggestions.filter(s => s.toLowerCase().includes(lower) && s !== value).slice(0, 8));
+  }, [value, suggestions]);
+
+  // Close on click outside
+  useEffect(() => {
+    const handler = (e) => { if (wrapRef.current && !wrapRef.current.contains(e.target)) setShowSuggestions(false); };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, []);
+
+  const hasSuggestions = filtered.length > 0;
+
   return (
-    <div style={{ display:"flex",flexDirection:"column",gap:6,...style }}>
+    <div ref={wrapRef} style={{ display:"flex",flexDirection:"column",gap:6,position:"relative",...style }}>
       <label style={{ fontSize:11,fontWeight:500,color:"rgba(255,255,255,.5)",letterSpacing:".08em",textTransform:"uppercase" }}>
         {label} {required && <span style={{ color:"#f43f5e" }}>*</span>}
       </label>
       <input type={type} value={value} onChange={e=>onChange(e.target.value)} placeholder={placeholder} disabled={disabled}
+        autoComplete="off"
         style={{ padding:"11px 14px",borderRadius:10,border:"1px solid rgba(255,255,255,.08)",
           background:disabled?"rgba(255,255,255,.02)":"rgba(255,255,255,.04)",
           color:disabled?"rgba(255,255,255,.3)":"#e2e8f0",fontSize:13,outline:"none",
           fontFamily:isMono?mono:sans,transition:"all .2s ease" }}
-        onFocus={e=>{e.target.style.borderColor="rgba(6,182,212,.5)";e.target.style.boxShadow="0 0 0 3px rgba(6,182,212,.1)"}}
-        onBlur={e=>{e.target.style.borderColor="rgba(255,255,255,.08)";e.target.style.boxShadow="none"}} />
+        onFocus={e=>{
+          e.target.style.borderColor="rgba(6,182,212,.5)";
+          e.target.style.boxShadow="0 0 0 3px rgba(6,182,212,.1)";
+          if (suggestions && suggestions.length > 0) setShowSuggestions(true);
+        }}
+        onBlur={e=>{
+          e.target.style.borderColor="rgba(255,255,255,.08)";
+          e.target.style.boxShadow="none";
+          // Delay hide so click on suggestion registers
+          setTimeout(() => setShowSuggestions(false), 150);
+        }} />
+      {/* Suggestions dropdown */}
+      {showSuggestions && hasSuggestions && (
+        <div style={{
+          position:"absolute",top:"100%",left:0,right:0,zIndex:50,
+          marginTop:2,borderRadius:10,overflow:"hidden",
+          background:"rgba(15,23,42,.97)",border:"1px solid rgba(6,182,212,.25)",
+          boxShadow:"0 8px 32px rgba(0,0,0,.5)",maxHeight:200,overflowY:"auto",
+        }}>
+          {filtered.map((s,i) => (
+            <div key={i}
+              onMouseDown={(e) => { e.preventDefault(); onChange(s); setShowSuggestions(false); }}
+              style={{
+                padding:"9px 14px",cursor:"pointer",fontSize:12,
+                color:"#e2e8f0",fontFamily:isMono?mono:sans,
+                borderBottom:i<filtered.length-1?"1px solid rgba(255,255,255,.04)":"none",
+                transition:"background .1s",
+              }}
+              onMouseEnter={e=>e.target.style.background="rgba(6,182,212,.12)"}
+              onMouseLeave={e=>e.target.style.background="transparent"}
+            >
+              {s}
+            </div>
+          ))}
+        </div>
+      )}
       {hint && <span style={{ fontSize:11,color:"rgba(255,255,255,.3)" }}>{hint}</span>}
     </div>
   );
@@ -130,7 +186,7 @@ function LogViewer({ logs, expanded, onToggle, title, status }) {
   );
 }
 
-function DirTree({ rawDataPath, showBBDuk }) {
+function DirTree({ rawDataPath, showBBDuk, showDecontam }) {
   const parent = rawDataPath ? rawDataPath.replace(/\/[^/]+\/?$/, "") : "/path/to/project";
   const rawName = rawDataPath ? rawDataPath.split("/").filter(Boolean).pop() : "raw_data";
   const items = [
@@ -153,6 +209,17 @@ function DirTree({ rawDataPath, showBBDuk }) {
       { d:4,n:"multiqc_report/",icon:"📊",desc:"Post-trim MultiQC" },
       { d:3,n:"logs/",icon:"📋",desc:"bbduk.log, fastqc.log, multiqc.log" },
       { d:3,n:"scripts/",icon:"📜",desc:"Versioned BBDuk script" },
+    ] : []),
+    ...(showDecontam ? [
+      ...(!showBBDuk ? [{ d:1,n:"2_reads_preprocessing/",icon:"📁",hl:true }] : []),
+      { d:2,n:"2_decontamination/",icon:"📁",hl:true },
+      { d:3,n:"input/",icon:"📂",desc:"→ symlinked trimmed reads" },
+      { d:3,n:"output/",icon:"📂" },
+      { d:4,n:"clean_reads/",icon:"🧹",desc:"Decontaminated .fastq.gz" },
+      { d:4,n:"fastqc_reports/",icon:"📊",desc:"Post-decontam FastQC" },
+      { d:4,n:"multiqc_report/",icon:"📊",desc:"Post-decontam MultiQC" },
+      { d:3,n:"logs/",icon:"📋",desc:"bbsplit.log" },
+      { d:3,n:"scripts/",icon:"📜",desc:"Versioned BBSplit script" },
     ] : []),
   ];
   return (
@@ -251,6 +318,36 @@ export default function App() {
   const [ptmLogs, setPtmLogs] = useState([]);
   const [ptmX, setPtmX] = useState(true);
 
+  // Decontamination
+  const DEFAULT_GENOMES = [
+    { name: "common_microbes", label: "Common Microbes", path: "resources/RQCFilterData/commonMicrobes/fusedERPBBmasked2.fa.gz", enabled: true },
+    { name: "human", label: "Human Genome (hg19)", path: "resources/RQCFilterData/human_genome/hg19_masked.fa.gz", enabled: true },
+    { name: "cat", label: "Cat Genome", path: "resources/RQCFilterData/cat_genome/cat_masked.fa.gz", enabled: true },
+    { name: "dog", label: "Dog Genome", path: "resources/RQCFilterData/dog_genome/dog_masked.fa.gz", enabled: true },
+    { name: "mouse", label: "Mouse Genome", path: "resources/RQCFilterData/mouse_genome/mouse_masked.fa.gz", enabled: true },
+  ];
+  const [decontam, setDecontam] = useState({
+    enabled: true,
+    genomes: DEFAULT_GENOMES.map(g => ({ ...g })),
+    customGenomes: [],
+    customGenomeName: "",
+    customGenomePath: "",
+    minid: 93,
+    threads: 4,
+    keepContaminantReads: false,
+    decontamSuffix: "_decontam",
+    decontamMqcName: "decontam_multiqc_report",
+  });
+  const [dcSplitSt, setDcSplitSt] = useState(S.idle);
+  const [dcSplitLogs, setDcSplitLogs] = useState([]);
+  const [dcSplitX, setDcSplitX] = useState(true);
+  const [dcFqcSt, setDcFqcSt] = useState(S.idle);
+  const [dcFqcLogs, setDcFqcLogs] = useState([]);
+  const [dcFqcX, setDcFqcX] = useState(true);
+  const [dcMqcSt, setDcMqcSt] = useState(S.idle);
+  const [dcMqcLogs, setDcMqcLogs] = useState([]);
+  const [dcMqcX, setDcMqcX] = useState(true);
+
   // Download
   const [dlStatus, setDlStatus] = useState(S.idle); // idle | running | success | error
   const [dlError, setDlError] = useState("");
@@ -259,6 +356,16 @@ export default function App() {
   useEffect(()=>{
     healthCheck().then(()=>setBackendOk(true)).catch(()=>setBackendOk(false));
   },[]);
+
+  // Autocomplete suggestions from SQLite
+  const [sug, setSug] = useState({});
+  const refreshSug = useCallback(() => {
+    loadAllSuggestions().then(s => { if (s) setSug(s); }).catch(()=>{});
+  }, []);
+  // Load on mount
+  useEffect(()=>{ refreshSug(); },[refreshSug]);
+  // Reload whenever step changes (e.g. user goes back to SSH step)
+  useEffect(()=>{ refreshSug(); },[step, refreshSug]);
 
   // ── SSH Connect ──
   const handleConnect = async () => {
@@ -276,6 +383,7 @@ export default function App() {
       lg("");
       lg("SUCCESS SSH connection established!");
       setSshStatus(S.success);
+      refreshSug();
       setTimeout(()=>setStep("tools"),800);
     } catch(e) {
       lg(`✗ ${e.message}`);
@@ -368,7 +476,7 @@ export default function App() {
       }
       if (msg.type === "status") {
         if (msg.stage === "fastqc") setFSt(msg.status);
-        else if (msg.stage === "multiqc") setMSt(msg.status);
+        else if (msg.stage === "multiqc") { setMSt(msg.status); if(msg.status==="success") refreshSug(); }
       }
     });
   };
@@ -407,7 +515,7 @@ export default function App() {
       if (msg.type === "status") {
         if (msg.stage === "bbduk") setBBSt(msg.status);
         else if (msg.stage === "post_fastqc") setPtfSt(msg.status);
-        else if (msg.stage === "post_multiqc") setPtmSt(msg.status);
+        else if (msg.stage === "post_multiqc") { setPtmSt(msg.status); if(msg.status==="success") refreshSug(); }
       }
     });
   };
@@ -422,6 +530,8 @@ export default function App() {
         multiqcName: pipe.multiqcName,
         includePostTrim: bbduk.enabled && ptmSt === S.success,
         postTrimMultiqcName: bbduk.postTrimMqcName,
+        includeDecontam: decontam.enabled && dcMqcSt === S.success,
+        decontamMultiqcName: decontam.decontamMqcName,
       });
       setDlStatus(S.success);
     } catch (e) {
@@ -430,13 +540,49 @@ export default function App() {
     }
   };
 
+  // ── Run Decontamination ──
+  const handleDecontamination = () => {
+    setDcSplitLogs([]); setDcSplitSt(S.running);
+    setDcFqcLogs([]); setDcFqcSt(S.idle);
+    setDcMqcLogs([]); setDcMqcSt(S.idle);
+    wsRunDecontamination({
+      session_id: sessionId, raw_data_path: pipe.rawDataPath,
+      fastqc_threads: pipe.fastqcThreads, tool_method: tool.method,
+      conda_env_name: tool.condaEnvName, pixi_project_path: tool.pixiProjectPath,
+      conda_use_mamba: tool.condaUseMamba, bbmap_dir: bbduk.bbmapDir,
+      genomes: decontam.genomes.filter(g => g.enabled),
+      custom_genomes: decontam.customGenomes,
+      minid: decontam.minid, bbsplit_threads: decontam.threads,
+      keep_contaminant_reads: decontam.keepContaminantReads,
+      decontam_suffix: decontam.decontamSuffix,
+      decontam_multiqc_name: decontam.decontamMqcName,
+      trimmed_suffix: bbduk.trimmedSuffix,
+    }, (msg) => {
+      if (msg.type === "log") {
+        if (msg.stage === "bbsplit") setDcSplitLogs(p => [...p, msg.message]);
+        else if (msg.stage === "decontam_fastqc") setDcFqcLogs(p => [...p, msg.message]);
+        else if (msg.stage === "decontam_multiqc") setDcMqcLogs(p => [...p, msg.message]);
+      }
+      if (msg.type === "status") {
+        if (msg.stage === "bbsplit") setDcSplitSt(msg.status);
+        else if (msg.stage === "decontam_fastqc") setDcFqcSt(msg.status);
+        else if (msg.stage === "decontam_multiqc") { setDcMqcSt(msg.status); if(msg.status==="success") refreshSug(); }
+      }
+    });
+  };
+
   const canTools = tool.method && (tool.method==="path" || (tool.method==="conda"&&tool.condaEnvName) || (tool.method==="pixi"&&tool.pixiProjectPath)) && instStatus===S.success;
   const canReview = pipe.rawDataPath && pipe.multiqcName && files.length>0 && scanSt===S.success;
   const canBBDukProceed = !bbduk.enabled || bbdukSetupSt===S.success;
-
   const toolLabel = tool.method==="conda"?`${tool.condaUseMamba?"Mamba":"Conda"} (${tool.condaEnvName})`:tool.method==="pixi"?`Pixi (${tool.pixiProjectPath})`:"System PATH";
 
-  const allDone = bbduk.enabled ? (fSt===S.success && mSt===S.success && bbSt===S.success && ptfSt===S.success && ptmSt===S.success) : (fSt===S.success && mSt===S.success);
+  const allDone = (() => {
+    const qcDone = fSt===S.success && mSt===S.success;
+    if (!bbduk.enabled) return qcDone;
+    const trimDone = bbSt===S.success && ptfSt===S.success && ptmSt===S.success;
+    if (!decontam.enabled) return qcDone && trimDone;
+    return qcDone && trimDone && dcSplitSt===S.success && dcFqcSt===S.success && dcMqcSt===S.success;
+  })();
 
   const resetAll = () => {
     setStep("connect"); setSshStatus(S.idle); setSessionId("");
@@ -445,6 +591,8 @@ export default function App() {
     setFSt(S.idle); setMSt(S.idle); setFLogs([]); setMLogs([]);
     setBBSt(S.idle); setBBLogs([]); setPtfSt(S.idle); setPtfLogs([]);
     setPtmSt(S.idle); setPtmLogs([]);
+    setDcSplitSt(S.idle); setDcSplitLogs([]); setDcFqcSt(S.idle); setDcFqcLogs([]);
+    setDcMqcSt(S.idle); setDcMqcLogs([]);
     setBBDukSetupSt(S.idle); setBBDukSetupLogs([]);
   };
 
@@ -482,11 +630,11 @@ export default function App() {
             <Card>
               <CTitle icon="🖥️">SSH Connection</CTitle>
               <div style={{ display:"grid",gridTemplateColumns:"2fr 1fr",gap:18,marginBottom:18 }}>
-                <Input label="Hostname / IP" value={ssh.hostname} onChange={v=>setSSH(p=>({...p,hostname:v}))} placeholder="hpc.university.edu" required isMono hint="HPC hostname or IP"/>
-                <Input label="Port" value={ssh.port} onChange={v=>setSSH(p=>({...p,port:v}))} placeholder="22" isMono hint="Default: 22"/>
+                <Input label="Hostname / IP" value={ssh.hostname} onChange={v=>setSSH(p=>({...p,hostname:v}))} placeholder="hpc.university.edu" required isMono hint="HPC hostname or IP" suggestions={sug.ssh_hostname||[]}/>
+                <Input label="Port" value={ssh.port} onChange={v=>setSSH(p=>({...p,port:v}))} placeholder="22" isMono hint="Default: 22" suggestions={sug.ssh_port||[]}/>
               </div>
               <div style={{ marginBottom:18 }}>
-                <Input label="Username" value={ssh.username} onChange={v=>setSSH(p=>({...p,username:v}))} placeholder="your_username" required isMono/>
+                <Input label="Username" value={ssh.username} onChange={v=>setSSH(p=>({...p,username:v}))} placeholder="your_username" required isMono suggestions={sug.ssh_username||[]}/>
               </div>
               <div style={{ marginBottom:18 }}>
                 <label style={{ fontSize:11,fontWeight:500,color:"rgba(255,255,255,.5)",letterSpacing:".08em",textTransform:"uppercase",display:"block",marginBottom:8 }}>Authentication</label>
@@ -499,7 +647,7 @@ export default function App() {
                 </div>
               </div>
               {ssh.authMethod==="password"&&<div style={{ marginBottom:18 }}><Input label="Password" value={ssh.password} onChange={v=>setSSH(p=>({...p,password:v}))} type="password" placeholder="••••••••" required/></div>}
-              {ssh.authMethod==="key"&&<div style={{ marginBottom:18 }}><Input label="Private Key Path" value={ssh.keyPath} onChange={v=>setSSH(p=>({...p,keyPath:v}))} placeholder="/home/user/.ssh/id_rsa" required isMono hint="Absolute path to private key"/></div>}
+              {ssh.authMethod==="key"&&<div style={{ marginBottom:18 }}><Input label="Private Key Path" value={ssh.keyPath} onChange={v=>setSSH(p=>({...p,keyPath:v}))} placeholder="/home/user/.ssh/id_rsa" required isMono hint="Absolute path to private key" suggestions={sug.ssh_key_path||[]}/></div>}
               <div style={{ marginBottom:18,padding:"10px 14px",borderRadius:10,background:"rgba(0,0,0,.25)",border:"1px solid rgba(255,255,255,.04)" }}>
                 <div style={{ fontSize:10,color:"rgba(255,255,255,.3)",textTransform:"uppercase",letterSpacing:".06em",marginBottom:4 }}>Command</div>
                 <code style={{ fontSize:12,color:"#06b6d4",fontFamily:mono }}>ssh {ssh.authMethod==="key"&&ssh.keyPath?`-i ${ssh.keyPath} `:""}-p {ssh.port||"22"} {ssh.username||"<user>"}@{ssh.hostname||"<hostname>"}</code>
@@ -542,7 +690,7 @@ export default function App() {
                   <span style={{ fontSize:12,color:"rgba(255,255,255,.5)" }}>Environment:</span>
                   <Toggle options={[{v:true,l:"Create new"},{v:false,l:"Use existing"}]} value={tool.condaCreateNew} onChange={v=>setTool(p=>({...p,condaCreateNew:v}))}/>
                 </div>
-                <Input label="Environment Name" value={tool.condaEnvName} onChange={v=>setTool(p=>({...p,condaEnvName:v}))} placeholder="metagenomics_qc" required isMono hint={tool.condaCreateNew?"Will be created":"Must exist on HPC"}/>
+                <Input label="Environment Name" value={tool.condaEnvName} onChange={v=>setTool(p=>({...p,condaEnvName:v}))} placeholder="metagenomics_qc" required isMono hint={tool.condaCreateNew?"Will be created":"Must exist on HPC"} suggestions={sug.conda_env_name||[]}/>
                 <div style={{ marginTop:20 }}>
                   <span style={{ fontSize:11,color:"rgba(255,255,255,.5)",letterSpacing:".08em",textTransform:"uppercase" }}>Install</span>
                   <div style={{ display:"flex",gap:12,marginTop:8 }}>
@@ -563,7 +711,7 @@ export default function App() {
                   <span style={{ fontSize:12,color:"rgba(255,255,255,.5)" }}>Project:</span>
                   <Toggle options={[{v:true,l:"Initialize new"},{v:false,l:"Use existing"}]} value={tool.pixiCreateNew} onChange={v=>setTool(p=>({...p,pixiCreateNew:v}))}/>
                 </div>
-                <Input label="Pixi Project Path" value={tool.pixiProjectPath} onChange={v=>setTool(p=>({...p,pixiProjectPath:v}))} placeholder="/home/user/pixi_envs/qc" required isMono hint={tool.pixiCreateNew?"Will be created with pixi init":"Must contain pixi.toml"}/>
+                <Input label="Pixi Project Path" value={tool.pixiProjectPath} onChange={v=>setTool(p=>({...p,pixiProjectPath:v}))} placeholder="/home/user/pixi_envs/qc" required isMono hint={tool.pixiCreateNew?"Will be created with pixi init":"Must contain pixi.toml"} suggestions={sug.pixi_project_path||[]}/>
                 <div style={{ marginTop:20 }}>
                   <span style={{ fontSize:11,color:"rgba(255,255,255,.5)",letterSpacing:".08em",textTransform:"uppercase" }}>Install</span>
                   <div style={{ display:"flex",gap:12,marginTop:8 }}>
@@ -613,7 +761,7 @@ export default function App() {
               <CTitle icon="📂">Raw Sequence Data</CTitle>
               <Input label="Path to raw FASTQ directory" value={pipe.rawDataPath}
                 onChange={v=>{setPipe(p=>({...p,rawDataPath:v}));setFiles([]);setPattern("");setScanSt(S.idle);setScanErr("")}}
-                placeholder="/home/user/project/raw_data" required isMono hint="Absolute path to .fastq.gz files"/>
+                placeholder="/home/user/project/raw_data" required isMono hint="Absolute path to .fastq.gz files" suggestions={sug.raw_data_path||[]}/>
 
               <button onClick={handleScan} disabled={!pipe.rawDataPath||scanSt===S.running}
                 style={{ marginTop:14,padding:"10px 20px",borderRadius:10,border:scanSt===S.success?"1px solid rgba(16,185,129,.25)":"1px solid rgba(6,182,212,.25)",
@@ -653,7 +801,7 @@ export default function App() {
 
             <Card>
               <CTitle icon="📊">MultiQC</CTitle>
-              <Input label="Report Name" value={pipe.multiqcName} onChange={v=>setPipe(p=>({...p,multiqcName:v}))} placeholder="my_project_multiqc" required isMono hint="Without .html"/>
+              <Input label="Report Name" value={pipe.multiqcName} onChange={v=>setPipe(p=>({...p,multiqcName:v}))} placeholder="my_project_multiqc" required isMono hint="Without .html" suggestions={sug.multiqc_name||[]}/>
               <div style={{ marginTop:10,fontSize:11,color:"rgba(255,255,255,.3)",fontFamily:mono }}>Output: <span style={{ color:"rgba(6,182,212,.7)" }}>analyses/1_QC/output/multiqc_report/{pipe.multiqcName||"..."}.html</span></div>
             </Card>
 
@@ -704,7 +852,7 @@ export default function App() {
                     <Input label="Path to bbduk.sh" value={bbduk.bbdukPath}
                       onChange={v=>setBBDuk(p=>({...p,bbdukPath:v}))}
                       placeholder="/path/to/bbmap/bbduk.sh" required isMono
-                      hint="Full path to the bbduk.sh script"/>
+                      hint="Full path to the bbduk.sh script" suggestions={sug.bbduk_path||[]}/>
                   </div>
                 )}
 
@@ -713,7 +861,7 @@ export default function App() {
                     <Input label="Installation directory" value={bbduk.installPath}
                       onChange={v=>setBBDuk(p=>({...p,installPath:v}))}
                       placeholder="/home/user/software" required isMono
-                      hint="BBMap will be downloaded and extracted here (creates bbmap/ subdirectory)"/>
+                      hint="BBMap will be downloaded and extracted here (creates bbmap/ subdirectory)" suggestions={sug.bbduk_install_path||[]}/>
                   </div>
                 )}
 
@@ -751,7 +899,7 @@ export default function App() {
                   ) : (
                     <Input label="Custom adapter FASTA path" value={bbduk.customAdapterPath}
                       onChange={v=>setBBDuk(p=>({...p,customAdapterPath:v}))}
-                      placeholder="/path/to/custom_adapters.fa" required isMono/>
+                      placeholder="/path/to/custom_adapters.fa" required isMono suggestions={sug.custom_adapter_path||[]}/>
                   )}
                 </Card>
               )}
@@ -785,17 +933,88 @@ export default function App() {
                     <Input label="Trimmed File Suffix" value={bbduk.trimmedSuffix}
                       onChange={v=>setBBDuk(p=>({...p,trimmedSuffix:v}))}
                       placeholder="_trimmed" isMono
-                      hint={`Output example: sample_28_R1${bbduk.trimmedSuffix || "_trimmed"}.fastq.gz`}/>
+                      hint={`Output example: sample_28_R1${bbduk.trimmedSuffix || "_trimmed"}.fastq.gz`} suggestions={sug.trimmed_suffix||[]}/>
                   </div>
 
                   <div style={{ marginTop:16 }}>
                     <Input label="Post-trim MultiQC Report Name" value={bbduk.postTrimMqcName}
                       onChange={v=>setBBDuk(p=>({...p,postTrimMqcName:v}))}
                       placeholder="post_trim_multiqc_report" isMono
-                      hint="Name for the MultiQC report on trimmed reads (without .html)"/>
+                      hint="Name for the MultiQC report on trimmed reads (without .html)" suggestions={sug.post_trim_multiqc_name||[]}/>
                   </div>
                 </Card>
               )}
+
+              {/* ── Decontamination Config ── */}
+              {bbdukSetupSt===S.success && (
+                <Card style={{ animation:"fadeIn .3s ease" }}>
+                  <CTitle icon="🧹">Contaminant DNA Removal (BBSplit)</CTitle>
+                  <div style={{ display:"flex",alignItems:"center",gap:16,marginBottom:16 }}>
+                    <label style={{ display:"flex",alignItems:"center",gap:10,cursor:"pointer",fontSize:14 }}>
+                      <input type="checkbox" checked={decontam.enabled} onChange={e=>setDecontam(p=>({...p,enabled:e.target.checked}))} style={{ accentColor:"#06b6d4",width:18,height:18 }}/>
+                      <span style={{ color:decontam.enabled?"#e2e8f0":"rgba(255,255,255,.4)" }}>Remove contaminant DNA after adapter trimming</span>
+                    </label>
+                  </div>
+                  {decontam.enabled && <p style={{ margin:"0 0 16px",fontSize:12,color:"rgba(255,255,255,.35)" }}>Uses trimmed reads as input. Post-decontam FastQC + MultiQC runs automatically.</p>}
+                </Card>
+              )}
+
+              {bbdukSetupSt===S.success && decontam.enabled && (<>
+                <Card style={{ animation:"fadeIn .3s ease" }}>
+                  <CTitle icon="🧬">Contaminant Reference Genomes</CTitle>
+                  <p style={{ margin:"0 0 14px",fontSize:12,color:"rgba(255,255,255,.35)" }}>Select genomes to screen against. All from BBMap's bundled RQCFilterData.</p>
+                  <div style={{ display:"flex",flexDirection:"column",gap:8 }}>
+                    {decontam.genomes.map((g,i)=>(
+                      <label key={g.name} style={{ display:"flex",alignItems:"center",gap:10,cursor:"pointer",padding:"8px 12px",borderRadius:8,background:g.enabled?"rgba(6,182,212,.06)":"rgba(255,255,255,.02)",border:g.enabled?"1px solid rgba(6,182,212,.15)":"1px solid rgba(255,255,255,.04)" }}>
+                        <input type="checkbox" checked={g.enabled} onChange={e=>{const u=[...decontam.genomes];u[i]={...u[i],enabled:e.target.checked};setDecontam(p=>({...p,genomes:u}))}} style={{ accentColor:"#06b6d4",width:16,height:16 }}/>
+                        <div>
+                          <div style={{ fontSize:13,fontWeight:500,color:g.enabled?"#e2e8f0":"rgba(255,255,255,.4)" }}>{g.label}</div>
+                          <div style={{ fontSize:10,color:"rgba(255,255,255,.25)",fontFamily:mono }}>{g.path}</div>
+                        </div>
+                      </label>
+                    ))}
+                  </div>
+                  <div style={{ marginTop:16,paddingTop:16,borderTop:"1px solid rgba(255,255,255,.06)" }}>
+                    <div style={{ fontSize:12,fontWeight:500,color:"rgba(255,255,255,.5)",marginBottom:8 }}>Add Custom Genome</div>
+                    <div style={{ display:"grid",gridTemplateColumns:"1fr 2fr auto",gap:8,alignItems:"end" }}>
+                      <Input label="Name" value={decontam.customGenomeName} onChange={v=>setDecontam(p=>({...p,customGenomeName:v}))} placeholder="chicken" isMono style={{ marginBottom:0 }}/>
+                      <Input label="Absolute Path" value={decontam.customGenomePath} onChange={v=>setDecontam(p=>({...p,customGenomePath:v}))} placeholder="/path/to/genome.fa.gz" isMono style={{ marginBottom:0 }}/>
+                      <button onClick={()=>{if(decontam.customGenomeName&&decontam.customGenomePath){setDecontam(p=>({...p,customGenomes:[...p.customGenomes,{name:p.customGenomeName,path:p.customGenomePath}],customGenomeName:"",customGenomePath:""}))}}}
+                        disabled={!decontam.customGenomeName||!decontam.customGenomePath}
+                        style={{ padding:"10px 16px",borderRadius:8,border:"none",background:decontam.customGenomeName&&decontam.customGenomePath?"rgba(6,182,212,.2)":"rgba(255,255,255,.03)",color:decontam.customGenomeName&&decontam.customGenomePath?"#06b6d4":"rgba(255,255,255,.3)",fontSize:13,fontWeight:600,cursor:decontam.customGenomeName&&decontam.customGenomePath?"pointer":"not-allowed" }}>+ Add</button>
+                    </div>
+                    {decontam.customGenomes.length>0 && (
+                      <div style={{ marginTop:10,display:"flex",flexDirection:"column",gap:6 }}>
+                        {decontam.customGenomes.map((g,i)=>(
+                          <div key={i} style={{ display:"flex",alignItems:"center",justifyContent:"space-between",padding:"6px 10px",borderRadius:6,background:"rgba(255,255,255,.03)",border:"1px solid rgba(255,255,255,.06)" }}>
+                            <span style={{ fontSize:12,color:"#e2e8f0" }}>{g.name} <span style={{ fontSize:10,color:"rgba(255,255,255,.25)",fontFamily:mono,marginLeft:8 }}>{g.path}</span></span>
+                            <button onClick={()=>setDecontam(p=>({...p,customGenomes:p.customGenomes.filter((_,j)=>j!==i)}))} style={{ padding:"2px 8px",borderRadius:4,border:"1px solid rgba(244,63,94,.2)",background:"rgba(244,63,94,.08)",color:"#f43f5e",fontSize:11,cursor:"pointer" }}>✕</button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </Card>
+
+                <Card style={{ animation:"fadeIn .3s ease" }}>
+                  <CTitle icon="🔧">BBSplit Parameters</CTitle>
+                  <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:14,marginBottom:16 }}>
+                    <Input label="minid (%)" value={String(decontam.minid)} type="number" onChange={v=>setDecontam(p=>({...p,minid:Number(v)}))} isMono hint="Min identity to classify as contaminant"/>
+                    <NumField label="Threads" value={decontam.threads} onChange={v=>setDecontam(p=>({...p,threads:v}))} def={4}/>
+                    <Input label="Output Suffix" value={decontam.decontamSuffix} onChange={v=>setDecontam(p=>({...p,decontamSuffix:v}))} isMono hint={`e.g. sample_28${decontam.decontamSuffix||"_decontam"}_R1.fastq.gz`} suggestions={sug.decontam_suffix||[]}/>
+                  </div>
+                  <div style={{ padding:"14px 16px",borderRadius:10,background:"rgba(245,158,11,.04)",border:"1px solid rgba(245,158,11,.12)",marginBottom:14 }}>
+                    <label style={{ display:"flex",alignItems:"flex-start",gap:10,cursor:"pointer" }}>
+                      <input type="checkbox" checked={decontam.keepContaminantReads} onChange={e=>setDecontam(p=>({...p,keepContaminantReads:e.target.checked}))} style={{ accentColor:"#f59e0b",width:16,height:16,marginTop:2 }}/>
+                      <div>
+                        <div style={{ fontSize:13,fontWeight:500,color:"#e2e8f0" }}>Keep contaminant-mapped reads in a separate folder</div>
+                        <div style={{ fontSize:11,color:"rgba(255,255,255,.35)",marginTop:2 }}>⚠ Recommended to discard to save disk space. Enable only if you need contaminant reads for downstream analysis.</div>
+                      </div>
+                    </label>
+                  </div>
+                  <Input label="Post-decontam MultiQC Report Name" value={decontam.decontamMqcName} onChange={v=>setDecontam(p=>({...p,decontamMqcName:v}))} placeholder="decontam_multiqc_report" isMono hint="Without .html" suggestions={sug.decontam_multiqc_name||[]}/>
+                </Card>
+              </>)}
             </>)}
 
             <div style={{ display:"flex",gap:12,marginTop:6 }}>
@@ -834,7 +1053,7 @@ export default function App() {
                 ))}
               </div>
             </Card>
-            <Card><CTitle icon="🌳">Directory Structure</CTitle><DirTree rawDataPath={pipe.rawDataPath} showBBDuk={bbduk.enabled}/></Card>
+            <Card><CTitle icon="🌳">Directory Structure</CTitle><DirTree rawDataPath={pipe.rawDataPath} showBBDuk={bbduk.enabled} showDecontam={bbduk.enabled && decontam.enabled}/></Card>
 
             {/* Exact commands preview */}
             {(() => {
@@ -982,18 +1201,50 @@ export default function App() {
               </div>
             )}
 
+            {/* Decontamination Section */}
+            {bbduk.enabled && decontam.enabled && bbSt===S.success && ptfSt===S.success && ptmSt===S.success && (
+              <div style={{ marginTop:28,animation:"fadeIn .5s ease" }}>
+                <div style={{ marginBottom:8,fontSize:12,fontWeight:600,color:"rgba(255,255,255,.4)",textTransform:"uppercase",letterSpacing:".06em" }}>Step 3: Contaminant DNA Removal</div>
+                <div style={{ display:"flex",gap:12,marginBottom:20,flexWrap:"wrap" }}>
+                  {[{l:"BBSplit",s:dcSplitSt},{l:"Post-decontam FastQC",s:dcFqcSt},{l:"Post-decontam MultiQC",s:dcMqcSt}].map((x,i)=>(
+                    <div key={i} style={{ flex:"1 1 auto",minWidth:100,padding:"12px 14px",borderRadius:14,textAlign:"center",background:x.s===S.success?"rgba(16,185,129,.08)":x.s===S.running?"rgba(245,158,11,.08)":x.s===S.error?"rgba(244,63,94,.08)":"rgba(255,255,255,.02)",border:`1px solid ${x.s===S.success?"rgba(16,185,129,.2)":x.s===S.running?"rgba(245,158,11,.2)":x.s===S.error?"rgba(244,63,94,.2)":"rgba(255,255,255,.06)"}` }}>
+                      <div style={{ fontSize:22,marginBottom:2,animation:x.s===S.running?"pulse 1.5s infinite":"none" }}>{x.s===S.success?"✅":x.s===S.running?"⏳":x.s===S.error?"❌":"⏸"}</div>
+                      <div style={{ fontSize:11,fontWeight:600,color:x.s===S.success?"#10b981":x.s===S.running?"#f59e0b":x.s===S.error?"#f43f5e":"rgba(255,255,255,.3)" }}>{x.l}</div>
+                    </div>
+                  ))}
+                </div>
+                {dcSplitSt===S.idle && (
+                  <div style={{ marginBottom:20 }}>
+                    <Btn onClick={handleDecontamination} color="green" style={{ fontSize:14,fontWeight:700,padding:14 }}>
+                      🧹 Start Decontamination (BBSplit + Post-decontam QC)
+                    </Btn>
+                  </div>
+                )}
+                {dcSplitSt!==S.idle && (
+                  <div style={{ display:"flex",flexDirection:"column",gap:14 }}>
+                    <LogViewer title="BBSplit Contaminant Removal" logs={dcSplitLogs} status={dcSplitSt} expanded={dcSplitX} onToggle={()=>setDcSplitX(p=>!p)}/>
+                    <LogViewer title="Post-decontam FastQC" logs={dcFqcLogs} status={dcFqcSt} expanded={dcFqcX} onToggle={()=>setDcFqcX(p=>!p)}/>
+                    <LogViewer title="Post-decontam MultiQC" logs={dcMqcLogs} status={dcMqcSt} expanded={dcMqcX} onToggle={()=>setDcMqcX(p=>!p)}/>
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* Completion Summary */}
             {allDone&&(
               <div style={{ marginTop:24,padding:"22px 24px",borderRadius:16,background:"linear-gradient(135deg,rgba(16,185,129,.06),rgba(6,182,212,.06))",border:"1px solid rgba(16,185,129,.15)",animation:"fadeIn .5s ease" }}>
                 <h3 style={{ margin:"0 0 14px",fontSize:17,fontWeight:700,color:"#10b981" }}>✓ Pipeline Complete</h3>
-                <DirTree rawDataPath={pipe.rawDataPath} showBBDuk={bbduk.enabled}/>
+                <DirTree rawDataPath={pipe.rawDataPath} showBBDuk={bbduk.enabled} showDecontam={bbduk.enabled && decontam.enabled}/>
                 <div style={{ marginTop:14,padding:"10px 14px",borderRadius:10,background:"rgba(0,0,0,.2)",fontFamily:mono,fontSize:11,color:"rgba(255,255,255,.45)",lineHeight:1.8 }}>
                   <div>📊 FastQC: analyses/1_QC/output/fastqc_reports/</div>
                   <div>📊 MultiQC: analyses/1_QC/output/multiqc_report/{pipe.multiqcName}.html</div>
                   {bbduk.enabled && ptmSt===S.success && (<>
-                    <div>✂️ Trimmed: analyses/2_reads_preprocessing/1_adapter_trimming_and_filtering/output/trimmed_reads/</div>
-                    <div>📊 Post-trim FastQC: .../1_adapter_trimming_and_filtering/output/fastqc_reports/</div>
+                    <div>✂️ Trimmed: .../1_adapter_trimming_and_filtering/output/trimmed_reads/</div>
                     <div>📊 Post-trim MultiQC: .../1_adapter_trimming_and_filtering/output/multiqc_report/{bbduk.postTrimMqcName}.html</div>
+                  </>)}
+                  {decontam.enabled && dcMqcSt===S.success && (<>
+                    <div>🧹 Clean reads: .../2_decontamination/output/clean_reads/</div>
+                    <div>📊 Post-decontam MultiQC: .../2_decontamination/output/multiqc_report/{decontam.decontamMqcName}.html</div>
                   </>)}
                   <div>📋 Logs: analyses/*/logs/</div>
                   <div>📜 Scripts: analyses/*/scripts/</div>
@@ -1006,9 +1257,12 @@ export default function App() {
                     <div>
                       <div style={{ fontSize:14,fontWeight:600,color:"#06b6d4" }}>Download MultiQC Reports</div>
                       <div style={{ fontSize:11,color:"rgba(255,255,255,.4)",marginTop:2 }}>
-                        {bbduk.enabled && ptmSt===S.success
-                          ? `Includes: ${pipe.multiqcName}.html + ${bbduk.postTrimMqcName}.html`
-                          : `Includes: ${pipe.multiqcName}.html`}
+                        {(() => {
+                          const reports = [pipe.multiqcName + ".html"];
+                          if (bbduk.enabled && ptmSt===S.success) reports.push(bbduk.postTrimMqcName + ".html");
+                          if (decontam.enabled && dcMqcSt===S.success) reports.push(decontam.decontamMqcName + ".html");
+                          return `Includes: ${reports.join(" + ")}`;
+                        })()}
                       </div>
                     </div>
                   </div>
